@@ -15,15 +15,15 @@ func doMap(
 	nReduce int, // the number of reduce task that will be run ("R" in the paper)
 	mapF func(filename string, contents string) []KeyValue) {
 
-	//读取处理数据
+	//璇诲彇澶勭悊鏁版嵁
 	data, err := ioutil.ReadFile(inFile)
 	if nil != err {
 		log.Fatal(err)
 	}
-	//调用map函数获得kv集合
+	//璋冪敤map鍑芥暟鑾峰緱kv闆嗗悎
 	kvs := mapF(inFile, string(data))
 
-	//创建nReduce 数量文件
+	//鍒涘缓nReduce 鏁伴噺鏂囦欢
 	var outFiles []*os.File
 	defer func() {
 		for _, file := range outFiles {
@@ -39,7 +39,7 @@ func doMap(
 		outFiles = append(outFiles, file)
 	}
 
-	//kv集合写入相应文件
+	//kv闆嗗悎鍐欏叆鐩稿簲鏂囦欢
 	for _, kv := range kvs {
 		index := ihash(kv.Key) % nReduce
 		enc := json.NewEncoder(outFiles[index])

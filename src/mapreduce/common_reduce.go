@@ -13,10 +13,10 @@ func doReduce(
 	nMap int, // the number of map tasks that were run ("M" in the paper)
 	reduceF func(key string, values []string) string) {
 
-	//ÏàÍ¬keyµÄ¼¯ºÏ
+	//ç›¸åŒkeyçš„é›†åˆ
 	kvsMap := make(map[string]([]string))
 
-	//±éÀú¶ÁreduceÎÄ¼ş
+	//éå†è¯»reduceæ–‡ä»¶
 	for i := 0; i < nMap; i++ {
 		name := reduceName(jobName, i, reduceTask)
 		file, err := os.Open(name)
@@ -30,19 +30,19 @@ func doReduce(
 			if err != nil {
 				break
 			}
-			//ºÏ²¢ÏàÍ¬keyµÄÊı¾İ
+			//åˆå¹¶ç›¸åŒkeyçš„æ•°æ®
 			kvsMap[kv.Key] = append(kvsMap[kv.Key], kv.Value)
 		}
 		file.Close()
 	}
 
-	//´´½¨reduceºÏ²¢½á¹ûÎÄ¼ş
+	//åˆ›å»ºreduceåˆå¹¶ç»“æœæ–‡ä»¶
 	reduceFile, err := os.Create(outFile)
 	if nil != err {
 		log.Fatal(err)
 	}
 	enc := json.NewEncoder(reduceFile)
-	//µ÷ÓÃreduceºÏ²¢ÏàÍ¬key²¢Ğ´ÈëÎÄ¼ş
+	//è°ƒç”¨reduceåˆå¹¶ç›¸åŒkeyå¹¶å†™å…¥æ–‡ä»¶
 	for key, value := range kvsMap {
 		data := reduceF(key, value)
 		kv := KeyValue{key, data}
