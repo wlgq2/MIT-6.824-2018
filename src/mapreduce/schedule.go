@@ -3,7 +3,6 @@ package mapreduce
 import (
 	"fmt"
 	"sync"
-	"time"
 )
 
 //
@@ -44,17 +43,15 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 				args.File = mapFiles[index]
 			}
 
-			worker := <-registerChan
-			for {
-				rst := call(worker, "Worker.DoTask", args, nil)
-				if rst {
-					//任务完成
-					wg.Done()
-					registerChan <- worker
-					break
-				}
-				time.Sleep(time.Duration(10) * time.Millisecond)
+			done := false
+			for ;!done;{
+				worker := <-registerChan
+				done = call(worker, "Worker.DoTask", args, nil)
+				go func(){registerChan <- worker  }()
 			}
+					
+			//任务完成
+			wg.Done()
 		}(i)
 	}
 	//等待所有任务完成
