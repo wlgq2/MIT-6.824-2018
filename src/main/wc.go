@@ -21,7 +21,7 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 		if _, ok := wordsKv[word]; ok {
 			wordsKv[word]++
 		} else {
-			wordsKv[word] = 0
+			wordsKv[word] = 1
 		}
 	}
 	//转换为输出格式
@@ -36,7 +36,7 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 	return rst
 }
 
-func reduceF(key string, values []string) string {
+func reduceF(key string, values []string) string  {
 	cnt := 0
     //合并统计结果
 	for _, value := range values {
