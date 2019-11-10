@@ -59,7 +59,7 @@ const Fallower, Leader, Candidate int = 1, 2, 3
 const HeartbeatTimeoutCnt int64 = 3
 
 //心跳周期
-const HeartbeatDuration = time.Duration(time.Millisecond * 400)
+const HeartbeatDuration = time.Duration(time.Millisecond * 350)
 
 //竞选周期随机范围，毫秒。
 const CandidateDuration int = 300
@@ -179,13 +179,11 @@ func (rf *Raft) getLogIndex() int {
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	fmt.Println(rf.me, "vote for", args.Me)
 	reply.IsAgree = true
 	reply.CurrentTerm = rf.currentTerm
 	//竞选任期小于自身任期，则反对票
 	if rf.currentTerm >= args.ElectionTerm {
 		reply.IsAgree = false
-		fmt.Println(rf.me, "vote for", args.Me, "false")
 		return
 	}
 	//竞选任期大于自身任期，则更像自身任期，并转为fallow
@@ -207,7 +205,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) OnHeartbeat(req *RequestHeartbeat, resp *RespHeartbeat) {
 	if req.Term > rf.currentTerm {
 		//发现其他节点任期大于自身任期，则变为fallow，并更新任期
-		fmt.Println(rf.me, "become fallow")
 		rf.currentTerm = req.Term
 		rf.setStatus(Fallower)
 		atomic.StoreInt64(&rf.heartBeatCnt, 0)
@@ -270,7 +267,7 @@ func (rf *Raft) resetCandidateTimer() {
 func (rf *Raft) Vote() {
 	//投票先增大自身任期
 	rf.currentTerm++
-	fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "try vote :", rf.me, "term :", rf.currentTerm)
+	fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "start vote :", rf.me, "term :", rf.currentTerm)
 	req := RequestVoteArgs{
 		Me:           rf.me,
 		ElectionTerm: rf.currentTerm,
@@ -297,12 +294,10 @@ func (rf *Raft) Vote() {
 			}()
 			select {
 			case rst = <-rstChan:
-			case <-time.After(time.Second * 1):
+			case <-time.After(time.Millisecond * 750):
 				//rpc调用超时
-				fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "rpc timeout")
 			}
 			if !rst {
-				fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "rpc error")
 				return
 			}
 			if resp.IsAgree {
@@ -316,7 +311,6 @@ func (rf *Raft) Vote() {
 		}(i)
 	}
 	wait.Wait()
-	fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "after vote :", rf.me)
 	//如果存在系统任期更大，则更像任期并转为fallow
 	if term > rf.currentTerm {
 		rf.currentTerm = term
@@ -324,7 +318,6 @@ func (rf *Raft) Vote() {
 		return
 	}
 	//获得多数赞同则变成leader
-	fmt.Println(rf.me, "get agree cnt", agreeVote)
 	if agreeVote*2 > peercnt {
 		fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me, "become leader.")
 		rf.setStatus(Leader)
@@ -376,7 +369,6 @@ func (rf *Raft) onCandidateTimeout() {
 	} else if rf.status == Fallower {
 		//如果心跳超时，则fallow转变为candidata并发动投票
 		if rf.heartBeatCnt >= HeartbeatTimeoutCnt {
-			fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me, "become candidate", rf.heartBeatCnt)
 			rf.setStatus(Candidate)
 			rf.Vote()
 		}
@@ -428,7 +420,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-	fmt.Println(rf.me, "start.")
 	return index, term, isLeader
 }
 
@@ -439,7 +430,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // turn off debug output from this instance.
 //
 func (rf *Raft) Kill() {
-	fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me, "kill.")
 	close(rf.killChan)
 }
 
