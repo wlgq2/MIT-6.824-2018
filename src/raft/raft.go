@@ -27,31 +27,6 @@ import "fmt"
 // import "bytes"
 // import "labgob"
 
-//
-// as each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
-// tester) on the same server, via the applyCh passed to Make(). set
-// CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
-//
-// in Lab 3 you'll want to send other kinds of messages (e.g.,
-// snapshots) on the applyCh; at that point you can add fields to
-// ApplyMsg, but set CommandValid to false for these other uses.
-//
-type ApplyMsg struct {
-	CommandValid bool
-	Command      interface{}
-	CommandIndex int
-}
-
-type Log struct {
-	index int
-}
-type TermLog struct {
-	TermIndex int
-	logs      []Log
-}
-
 //节点状态
 const Fallower, Leader, Candidate int = 1, 2, 3
 
@@ -64,47 +39,135 @@ const HeartbeatDuration = time.Duration(time.Millisecond * 350)
 //竞选周期随机范围，毫秒。
 const CandidateDuration int = 300
 
+type ApplyMsg struct {
+	CommandValid bool
+	Command      interface{}
+	CommandIndex int
+}
+
+type LogEntry struct {
+	Term  int
+	Index int
+	Log   interface{}
+}
+
 //投票请求
 type RequestVoteArgs struct {
-	Me              int
-	ElectionTerm    int64
-	CurrentLogIndex int
-	CurrentLogTerm  int
+	Me           int
+	ElectionTerm int
+	LogIndex     int
+	LogTerm      int
 }
 
 //投票rpc返回
 type RequestVoteReply struct {
 	IsAgree     bool
-	CurrentTerm int64
+	CurrentTerm int
+}
+
+//日志复制请求
+type AppendEntries struct {
+	Me           int
+	Term         int
+	PrevLogTerm  int
+	PrevLogIndex int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+//回复日志更新请求
+type RespEntries struct {
+	Term      int
+	Successed bool
+}
+
+type RespStart struct {
+	term     int
+	index    int
+	isLeader bool
 }
 
 type Raft struct {
-	mu             sync.Mutex          // Lock to protect shared access to this peer's state
+	//所有的状态改变及log增减都在MainLoop协程执行，所以不需要锁
+	//mu             sync.Mutex          // Lock to protect shared access to this peer's state
 	peers          []*labrpc.ClientEnd // rpc节点
 	persister      *Persister          // Object to hold this peer's persisted state
 	me             int                 // 自己服务编号
-	logs           []TermLog           // 日志存储
+	logs           []LogEntry          // 日志存储
+	logIndexs      map[int]int         //记录日志所在位置索引，用于减少查找日志时间复杂度，空间换时间
 	heartBeatCnt   int64               // 心跳计数
 	status         int                 //节点状态
-	currentTerm    int64               //当前周期
-	heartbeatTimer *time.Timer         //心跳定时器
-	candidateTimer *time.Timer         //竞选超时定时器
-	randtime       *rand.Rand          //随机数，用于随机竞选周期，避免节点间竞争。
-	killChan       chan (int)          //退出节点
+	currentTerm    int                 //当前周期
+	commitIndex    int
+	heartbeatTimer *time.Timer //心跳定时器
+	candidateTimer *time.Timer //竞选超时定时器
+	randtime       *rand.Rand  //随机数，用于随机竞选周期，避免节点间竞争。
+
+	nextIndex []int //记录每个fallow的日志状态
+
+	killChan         chan (int)              //退出节点
+	voteChan         chan (RequestVoteArgs)  //投票
+	voteRstChan      chan (RequestVoteReply) //投票结果
+	entriesChan      chan (AppendEntries)    //投票
+	entriesRstChan   chan (RespEntries)      //投票结果
+	startLogChan     chan (interface{})
+	respStartLogChan chan (RespStart)
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
 }
 
-// return currentTerm and whether this server
-// believes it is the leader.
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppendEnteries(server int, req *AppendEntries, resp *RespEntries) bool {
+	ok := rf.peers[server].Call("Raft.RequestAppendEntries", req, resp)
+	return ok
+}
+
 func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	term = len(rf.logs)
 	isleader = rf.status == Leader
 	return term, isleader
+}
+
+func (rf *Raft) setStatus(status int) {
+	//设置节点状态，变换为fallow时候重置选举定时器
+	if (rf.status != Fallower) && (status == Fallower) {
+		rf.resetCandidateTimer()
+	}
+
+	//节点变为leader，则初始化fallow日志状态
+	if rf.status != Leader && status == Leader {
+		size := len(rf.peers)
+		index := len(rf.logs)
+		for i := 0; i < size; i++ {
+			if (len(rf.nextIndex)) <= i {
+				rf.nextIndex = append(rf.nextIndex, index)
+			} else {
+				rf.nextIndex[i] = index
+			}
+		}
+	}
+	rf.status = status
+
+}
+
+//获取日志索引及任期
+func (rf *Raft) getLogTermAndIndex() (int, int) {
+	index := 0
+	term := 0
+	size := len(rf.logs)
+	if size > 0 {
+		index = rf.logs[size-1].Index
+		term = rf.logs[size-1].Term
+	}
+	return term, index
 }
 
 //
@@ -145,132 +208,49 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-
-type RequestHeartbeat struct {
-	Me   int
-	Term int64
-}
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RespHeartbeat struct {
-
-	// Your data here (2A).
-}
-
-func (rf *Raft) setStatus(status int) {
-	//设置节点状态，变换为fallow时候重置选举定时器
-	if (rf.status != Fallower) && (status == Fallower) {
-		rf.resetCandidateTimer()
-	}
-	rf.status = status
-}
-
-func (rf *Raft) getLogIndex() int {
-	termlogs := rf.logs[len(rf.logs)-1].logs
-	logindex := termlogs[len(termlogs)-1].index
-	return logindex
-}
-
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	reply.IsAgree = true
-	reply.CurrentTerm = rf.currentTerm
+	rf.voteChan <- *args
+	*reply = <-rf.voteRstChan
+}
+
+func (rf *Raft) onVote(args *RequestVoteArgs) RequestVoteReply {
+	reply := RequestVoteReply{
+		IsAgree:     true,
+		CurrentTerm: rf.currentTerm,
+	}
 	//竞选任期小于自身任期，则反对票
 	if rf.currentTerm >= args.ElectionTerm {
 		reply.IsAgree = false
-		return
+		return reply
 	}
-	//竞选任期大于自身任期，则更像自身任期，并转为fallow
+	//竞选任期大于自身任期，则更新自身任期，并转为fallow
 	rf.setStatus(Fallower)
 	rf.currentTerm = args.ElectionTerm
+
+	logterm, logindex := rf.getLogTermAndIndex()
+	//判定竞选者日志是否更新
+	if logterm > args.LogTerm {
+		reply.IsAgree = false
+	} else if logterm == args.LogTerm {
+		reply.IsAgree = logindex <= args.LogIndex
+	}
 	if reply.IsAgree {
 		//赞同票后重置心跳（避免竞选竞争，增加一次选举成功的概率）
 		rf.heartBeatCnt = 0
 	}
-	/*
-		if args.CurrentLogIndex < rf.getLogIndex() {
-			reply.IsAgree = false
-			return
-		}
-	*/
-	// Your code here (2A, 2B).
+	return reply
 }
-
-func (rf *Raft) OnHeartbeat(req *RequestHeartbeat, resp *RespHeartbeat) {
-	if req.Term > rf.currentTerm {
-		//发现其他节点任期大于自身任期，则变为fallow，并更新任期
-		rf.currentTerm = req.Term
-		rf.setStatus(Fallower)
-		atomic.StoreInt64(&rf.heartBeatCnt, 0)
-	} else if req.Term == rf.currentTerm {
-		if rf.status == Fallower {
-			atomic.StoreInt64(&rf.heartBeatCnt, 0)
-		}
-	}
-
-}
-
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
-
-func (rf *Raft) sendHeartbeat(server int, req *RequestHeartbeat, resp *RespHeartbeat) bool {
-	ok := rf.peers[server].Call("Raft.OnHeartbeat", req, resp)
-	return ok
-}
-
-//重置竞选周期定时
-func (rf *Raft) resetCandidateTimer() {
-	randCnt := rf.randtime.Intn(CandidateDuration)
-	cnt := time.Duration(randCnt)*time.Millisecond + time.Duration(HeartbeatTimeoutCnt)*HeartbeatDuration
-	duration := time.Duration(cnt)
-	rf.candidateTimer.Reset(duration)
-}
-
 
 func (rf *Raft) Vote() {
 	//投票先增大自身任期
 	rf.currentTerm++
 	fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "start vote :", rf.me, "term :", rf.currentTerm)
+	logterm, logindex := rf.getLogTermAndIndex()
 	req := RequestVoteArgs{
 		Me:           rf.me,
 		ElectionTerm: rf.currentTerm,
+		LogTerm:      logterm,
+		LogIndex:     logindex,
 	}
 	var wait sync.WaitGroup
 	peercnt := len(rf.peers)
@@ -321,17 +301,120 @@ func (rf *Raft) Vote() {
 	if agreeVote*2 > peercnt {
 		fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me, "become leader.")
 		rf.setStatus(Leader)
-		req := RequestHeartbeat{
-			Me:   rf.me,
-			Term: rf.currentTerm,
+		rf.appendEntries()
+	}
+}
+
+func (rf *Raft) RequestAppendEntries(req *AppendEntries, resp *RespEntries) {
+	rf.entriesChan <- *req
+	*resp = <-rf.entriesRstChan
+}
+
+func (rf *Raft) updateLog(index int, log LogEntry) {
+	if index < len(rf.logs) {
+		rf.logs[index] = log
+	} else {
+		rf.logs = append(rf.logs, log)
+	}
+	rf.logIndexs[log.Index] = index
+	fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me," update log ",index,":",log.Term,"-",log.Index)
+}
+
+func (rf *Raft) OnAppendEntries(req *AppendEntries) RespEntries {
+	resp := RespEntries{
+		Term:      rf.currentTerm,
+		Successed: true,
+	}
+	if req.Term < rf.currentTerm {
+		//leader任期小于自身任期，则拒绝同步log
+		resp.Successed = false
+		return resp
+	}
+	//否则更新自身任期，切换自生为fallow，清空心跳超时计数
+	rf.currentTerm = req.Term
+	rf.setStatus(Fallower)
+	atomic.StoreInt64(&rf.heartBeatCnt, 0)
+	if len(req.Entries) > 0 {
+		fmt.Println(rf.me, "update logs")
+	}
+	//判定与leader日志是一致
+	index := -1
+	ok := true
+	if req.PrevLogIndex >= 0 {
+		if index, ok = rf.logIndexs[req.PrevLogIndex]; !ok {
+			//改索引在自身日志中不存在，则拒绝更新
+			fmt.Println(rf.me, "can't find index", req.PrevLogIndex, "in maps")
+			resp.Successed = false
+			return resp
 		}
-		resp := RespHeartbeat{}
-		for i := 0; i < len(rf.peers); i++ {
-			if i != rf.me {
-				go func(index int) {
-					rf.sendHeartbeat(index, &req, &resp)
-				}(i)
-			}
+		if rf.logs[index].Term != req.PrevLogTerm {
+			//该索引与自身日志不同，则拒绝更新
+			fmt.Println(rf.me, "term error", req.PrevLogTerm, rf.logs[index].Term)
+			resp.Successed = false
+			return resp
+		}
+	}
+	//更新日志
+	size := len(req.Entries)
+	for i := 0; i < size; i++ {
+		rf.updateLog(index+i+1, req.Entries[i])
+	}
+	return resp
+
+}
+
+func (rf *Raft) getEntriesInfo(index int, entries *[]LogEntry) (preterm int, preindex int) {
+	pre := index - 1
+
+	//即fallow 日志为空
+	if pre < 0 {
+		preterm = -1
+		preindex = -1
+	} else {
+		preindex = rf.logs[pre].Index
+		preterm = rf.logs[pre].Term
+	}
+	for i := index; i < len(rf.logs); i++ {
+		*entries = append(*entries, rf.logs[index])
+	}
+	return
+}
+
+func (rf *Raft) appendEntries() {
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go func(index int) {
+				req := AppendEntries{
+					Me:           rf.me,
+					Term:         rf.currentTerm,
+					LeaderCommit: rf.commitIndex,
+				}
+				resp := RespEntries{}
+				//当前fallow的日志状态
+				next := rf.nextIndex[index]
+				req.PrevLogTerm, req.PrevLogIndex = rf.getEntriesInfo(next, &req.Entries)
+				if len(req.Entries) > 0 {
+					fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "replicate log to ", index, " preterm", req.PrevLogTerm, " preindex", req.PrevLogIndex)
+				}
+				rst := rf.sendAppendEnteries(index, &req, &resp)
+				if rst {
+					//如果某个节点任期大于自己，则更新任期，变成fallow
+					if resp.Term > rf.currentTerm {
+						rf.currentTerm = resp.Term
+						rf.setStatus(Fallower)
+						return
+					}
+					//如果更新失败则fallow日志状态减1
+					if !resp.Successed {
+						if rf.nextIndex[index] > 0 {
+							rf.nextIndex[index]--
+						}
+					} else {
+						//更新成功
+						rf.nextIndex[index] += len(req.Entries)
+					}
+				}
+			}(i)
 		}
 	}
 }
@@ -339,21 +422,10 @@ func (rf *Raft) Vote() {
 //心跳周期
 func (rf *Raft) onHeartbeatTimerout() {
 	if rf.status == Fallower {
-		//心跳技术+1
+		//心跳计数+1
 		atomic.AddInt64(&rf.heartBeatCnt, 1)
 	} else if rf.status == Leader {
-		req := RequestHeartbeat{
-			Me:   rf.me,
-			Term: rf.currentTerm,
-		}
-		resp := RespHeartbeat{}
-		for i := 0; i < len(rf.peers); i++ {
-			if i != rf.me {
-				go func(index int) {
-					rf.sendHeartbeat(index, &req, &resp)
-				}(i)
-			}
-		}
+		rf.appendEntries()
 		atomic.StoreInt64(&rf.heartBeatCnt, 0)
 	} else {
 		atomic.StoreInt64(&rf.heartBeatCnt, 0)
@@ -376,6 +448,74 @@ func (rf *Raft) onCandidateTimeout() {
 	}
 }
 
+//重置竞选周期定时
+func (rf *Raft) resetCandidateTimer() {
+	randCnt := rf.randtime.Intn(CandidateDuration)
+	cnt := time.Duration(randCnt)*time.Millisecond + time.Duration(HeartbeatTimeoutCnt)*HeartbeatDuration
+	duration := time.Duration(cnt)
+	rf.candidateTimer.Reset(duration)
+}
+
+func (rf *Raft) insertLog(command interface{}) int {
+	entry := LogEntry{
+		Term:  rf.currentTerm,
+		Index: -1,
+		Log:   command,
+	}
+	//获取log索引，并插入map中
+	_, index := rf.getLogTermAndIndex()
+	index++
+	entry.Index = index
+	rf.logIndexs[index] = len(rf.logs)
+	//插入log
+	rf.logs = append(rf.logs, entry)
+	return index
+}
+
+func (rf *Raft) startLog(command interface{}) RespStart {
+	resp := RespStart{
+		term:     -1,
+		index:    -1,
+		isLeader: rf.status == Leader,
+	}
+
+	if resp.isLeader {
+		//设置term并插入log
+		resp.term = rf.currentTerm
+		resp.index = rf.insertLog(command)
+		fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "leader :", rf.me, "append log", resp.term, resp.index)
+		//同步log给fallow
+		rf.appendEntries()
+	}
+	return resp
+}
+
+//
+// the service using Raft (e.g. a k/v server) wants to start
+// agreement on the next command to be appended to Raft's log. if this
+// server isn't the leader, returns false. otherwise start the
+// agreement and return immediately. there is no guarantee that this
+// command will ever be committed to the Raft log, since the leader
+// may fail or lose an election. even if the Raft instance has been killed,
+// this function should return gracefully.
+//
+// the first return value is the index that the command will appear at
+// if it's ever committed. the second return value is the current
+// term. the third return value is true if this server believes it is
+// the leader.
+//
+func (rf *Raft) Start(command interface{}) (int, int, bool) {
+
+	rf.startLogChan <- command
+	rst := <-rf.respStartLogChan
+	return rst.index, rst.term, rst.isLeader
+}
+
+func (rf *Raft) Kill() {
+	fmt.Println("kill")
+	close(rf.killChan)
+}
+
 //主轮询loop
 func (rf *Raft) MainLoop() {
 	//心跳定时器
@@ -394,43 +534,16 @@ func (rf *Raft) MainLoop() {
 			rf.onHeartbeatTimerout()
 		case <-rf.candidateTimer.C:
 			rf.onCandidateTimeout()
+		case req := <-rf.voteChan:
+			rf.voteRstChan <- rf.onVote(&req)
+		case req := <-rf.entriesChan:
+			rf.entriesRstChan <- rf.OnAppendEntries(&req)
+		case args := <-rf.startLogChan:
+			rf.respStartLogChan <- rf.startLog(args)
 		case <-rf.killChan:
 			return
 		}
 	}
-}
-
-//
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election. even if the Raft instance has been killed,
-// this function should return gracefully.
-//
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
-//
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
-	// Your code here (2B).
-	return index, term, isLeader
-}
-
-//
-// the tester calls Kill() when a Raft instance won't
-// be needed again. you are not required to do anything
-// in Kill(), but it might be convenient to (for example)
-// turn off debug output from this instance.
-//
-func (rf *Raft) Kill() {
-	close(rf.killChan)
 }
 
 //
@@ -453,8 +566,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.status = Fallower
 	rf.currentTerm = 0
+	rf.commitIndex = 0
 	rf.randtime = rand.New(rand.NewSource(time.Now().UnixNano()))
+	rf.logIndexs = make(map[int]int)
 	rf.killChan = make(chan (int))
+	rf.voteChan = make(chan (RequestVoteArgs))
+	rf.voteRstChan = make(chan (RequestVoteReply))
+	rf.entriesChan = make(chan (AppendEntries))
+	rf.entriesRstChan = make(chan (RespEntries))
+	rf.startLogChan = make(chan (interface{}))
+	rf.respStartLogChan = make(chan (RespStart))
 	//主循环
 	go rf.MainLoop()
 	// Your initialization code here (2A, 2B, 2C).
