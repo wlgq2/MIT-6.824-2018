@@ -95,16 +95,18 @@ type Raft struct {
 	me             int                 // 自己服务编号
 	logs           []LogEntry          // 日志存储
 	logIndexs      map[int]int         //记录日志所在位置索引，用于减少查找日志时间复杂度，空间换时间
+	commitIndex    int                 //当前日志提交处
+	lastApplied    int                 //当前状态机执行处
 	heartBeatCnt   int64               // 心跳计数
 	status         int                 //节点状态
 	currentTerm    int                 //当前周期
-	commitIndex    int
-	heartbeatTimer *time.Timer //心跳定时器
-	candidateTimer *time.Timer //竞选超时定时器
-	randtime       *rand.Rand  //随机数，用于随机竞选周期，避免节点间竞争。
+	heartbeatTimer *time.Timer         //心跳定时器
+	candidateTimer *time.Timer         //竞选超时定时器
+	randtime       *rand.Rand          //随机数，用于随机竞选周期，避免节点间竞争。
 
 	nextIndex []int //记录每个fallow的日志状态
 
+	applyCh          chan ApplyMsg
 	killChan         chan (int)              //退出节点
 	voteChan         chan (RequestVoteArgs)  //投票
 	voteRstChan      chan (RequestVoteReply) //投票结果
@@ -119,12 +121,33 @@ type Raft struct {
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	rstChan := make(chan (bool))
+	ok := false
+	go func() {
+		rst := rf.peers[server].Call("Raft.RequestVote", args, reply)
+		rstChan <- rst
+	}()
+	select {
+	case ok = <-rstChan:
+	case <-time.After(time.Millisecond * 750):
+		//rpc调用超时
+	}
 	return ok
 }
 
 func (rf *Raft) sendAppendEnteries(server int, req *AppendEntries, resp *RespEntries) bool {
-	ok := rf.peers[server].Call("Raft.RequestAppendEntries", req, resp)
+	rstChan := make(chan (bool))
+	ok := false
+	go func() {
+		rst := rf.peers[server].Call("Raft.RequestAppendEntries", req, resp)
+		rstChan <- rst
+	}()
+	select {
+	case ok = <-rstChan:
+	case <-time.After(HeartbeatDuration):
+		//rpc调用超时
+	}
+
 	return ok
 }
 
@@ -266,17 +289,7 @@ func (rf *Raft) Vote() {
 				agreeVote++
 				return
 			}
-			rstChan := make(chan (bool))
-			rst := false
-			go func() {
-				rst := rf.sendRequestVote(index, &req, &resp)
-				rstChan <- rst
-			}()
-			select {
-			case rst = <-rstChan:
-			case <-time.After(time.Millisecond * 750):
-				//rpc调用超时
-			}
+			rst := rf.sendRequestVote(index, &req, &resp)
 			if !rst {
 				return
 			}
@@ -317,7 +330,7 @@ func (rf *Raft) updateLog(index int, log LogEntry) {
 		rf.logs = append(rf.logs, log)
 	}
 	rf.logIndexs[log.Index] = index
-	fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me," update log ",index,":",log.Term,"-",log.Index)
+	fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me, " update log ", index, ":", log.Term, "-", log.Index)
 }
 
 func (rf *Raft) OnAppendEntries(req *AppendEntries) RespEntries {
@@ -359,6 +372,9 @@ func (rf *Raft) OnAppendEntries(req *AppendEntries) RespEntries {
 	for i := 0; i < size; i++ {
 		rf.updateLog(index+i+1, req.Entries[i])
 	}
+	rf.logs = rf.logs[:(index + size + 1)]
+	rf.commitIndex = req.LeaderCommit
+	rf.apply()
 	return resp
 
 }
@@ -380,42 +396,82 @@ func (rf *Raft) getEntriesInfo(index int, entries *[]LogEntry) (preterm int, pre
 	return
 }
 
-func (rf *Raft) appendEntries() {
-	for i := 0; i < len(rf.peers); i++ {
-		if i != rf.me {
-			go func(index int) {
-				req := AppendEntries{
-					Me:           rf.me,
-					Term:         rf.currentTerm,
-					LeaderCommit: rf.commitIndex,
-				}
-				resp := RespEntries{}
-				//当前fallow的日志状态
-				next := rf.nextIndex[index]
-				req.PrevLogTerm, req.PrevLogIndex = rf.getEntriesInfo(next, &req.Entries)
-				if len(req.Entries) > 0 {
-					fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "replicate log to ", index, " preterm", req.PrevLogTerm, " preindex", req.PrevLogIndex)
-				}
-				rst := rf.sendAppendEnteries(index, &req, &resp)
-				if rst {
-					//如果某个节点任期大于自己，则更新任期，变成fallow
-					if resp.Term > rf.currentTerm {
-						rf.currentTerm = resp.Term
-						rf.setStatus(Fallower)
-						return
-					}
-					//如果更新失败则fallow日志状态减1
-					if !resp.Successed {
-						if rf.nextIndex[index] > 0 {
-							rf.nextIndex[index]--
-						}
-					} else {
-						//更新成功
-						rf.nextIndex[index] += len(req.Entries)
-					}
-				}
-			}(i)
+func (rf *Raft) apply() {
+
+	_, last := rf.getLogTermAndIndex()
+	for ; rf.lastApplied <= rf.commitIndex && rf.lastApplied <= last; rf.lastApplied++ {
+		if index, ok := rf.logIndexs[rf.lastApplied]; ok {
+			msg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.logs[index].Log,
+				CommandIndex: rf.logs[index].Index,
+			}
+			rf.applyCh <- msg
 		}
+	}
+	rf.lastApplied--
+}
+
+func (rf *Raft) appendEntries() {
+	var wg sync.WaitGroup
+	wg.Add(3)
+	successedCnt := 0
+	term := 0
+	count := len(rf.peers)
+	for i := 0; i < count; i++ {
+		go func(index int) {
+			defer wg.Done()
+			if i == rf.me {
+				successedCnt++
+				return
+			}
+			req := AppendEntries{
+				Me:           rf.me,
+				Term:         rf.currentTerm,
+				LeaderCommit: rf.commitIndex,
+			}
+			resp := RespEntries{Term: 0}
+			//当前fallow的日志状态
+			next := rf.nextIndex[index]
+			req.PrevLogTerm, req.PrevLogIndex = rf.getEntriesInfo(next, &req.Entries)
+			if len(req.Entries) > 0 {
+				fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "replicate log to ", index, " preterm", req.PrevLogTerm, " preindex", req.PrevLogIndex)
+			}
+
+			rst := rf.sendAppendEnteries(index, &req, &resp)
+
+			if rst {
+				//如果某个节点任期大于自己，则更新任期，变成fallow
+				if resp.Term > rf.currentTerm {
+					if resp.Term > term {
+						term = resp.Term
+					}
+					return
+				}
+				//如果更新失败则fallow日志状态减1
+				if !resp.Successed {
+					if rf.nextIndex[index] > 0 {
+						rf.nextIndex[index]--
+					}
+				} else {
+					//更新成功
+					rf.nextIndex[index] += len(req.Entries)
+					successedCnt++
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	//发现有更大term
+	if term > rf.currentTerm {
+		rf.currentTerm = term
+		rf.setStatus(Fallower)
+		return
+	}
+	//日志提交成功
+	if successedCnt*2 > count {
+		_, rf.commitIndex = rf.getLogTermAndIndex()
+		rf.apply()
 	}
 }
 
@@ -567,6 +623,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.status = Fallower
 	rf.currentTerm = 0
 	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.applyCh = applyCh
 	rf.randtime = rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.logIndexs = make(map[int]int)
 	rf.killChan = make(chan (int))
