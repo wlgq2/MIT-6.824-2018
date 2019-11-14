@@ -45,6 +45,7 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+//日志
 type LogEntry struct {
 	Term  int
 	Index int
@@ -396,6 +397,7 @@ func (rf *Raft) getEntriesInfo(index int, entries *[]LogEntry) (preterm int, pre
 	return
 }
 
+//apply 状态机
 func (rf *Raft) apply() {
 
 	_, last := rf.getLogTermAndIndex()
@@ -413,11 +415,11 @@ func (rf *Raft) apply() {
 }
 
 func (rf *Raft) appendEntries() {
-	var wg sync.WaitGroup
-	wg.Add(3)
 	successedCnt := 0
 	term := 0
 	count := len(rf.peers)
+	var wg sync.WaitGroup
+	wg.Add(count)
 	for i := 0; i < count; i++ {
 		go func(index int) {
 			defer wg.Done()
