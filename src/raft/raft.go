@@ -154,7 +154,7 @@ func (rf *Raft) sendAppendEnteries(server int, req *AppendEntries, resp *RespEnt
 func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
-	term = len(rf.logs)
+	term = rf.currentTerm
 	isleader = rf.status == Leader
 	return term, isleader
 }
