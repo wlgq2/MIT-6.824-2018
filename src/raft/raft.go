@@ -148,7 +148,6 @@ func (rf *Raft) sendAppendEnteries(server int, req *AppendEntries, resp *RespEnt
 	case <-time.After(HeartbeatDuration):
 		//rpc调用超时
 	}
-
 	return ok
 }
 
@@ -348,9 +347,6 @@ func (rf *Raft) OnAppendEntries(req *AppendEntries) RespEntries {
 	rf.currentTerm = req.Term
 	rf.setStatus(Fallower)
 	atomic.StoreInt64(&rf.heartBeatCnt, 0)
-	if len(req.Entries) > 0 {
-		fmt.Println(rf.me, "update logs")
-	}
 	//判定与leader日志是一致
 	index := -1
 	ok := true
@@ -392,26 +388,25 @@ func (rf *Raft) getEntriesInfo(index int, entries *[]LogEntry) (preterm int, pre
 		preterm = rf.logs[pre].Term
 	}
 	for i := index; i < len(rf.logs); i++ {
-		*entries = append(*entries, rf.logs[index])
+		*entries = append(*entries, rf.logs[i])
 	}
 	return
 }
 
 //apply 状态机
 func (rf *Raft) apply() {
-
 	_, last := rf.getLogTermAndIndex()
-	for ; rf.lastApplied <= rf.commitIndex && rf.lastApplied <= last; rf.lastApplied++ {
-		if index, ok := rf.logIndexs[rf.lastApplied]; ok {
+	for ; rf.lastApplied < rf.commitIndex && rf.lastApplied < last; rf.lastApplied++ {
+		if index, ok := rf.logIndexs[rf.lastApplied+1]; ok {
 			msg := ApplyMsg{
 				CommandValid: true,
 				Command:      rf.logs[index].Log,
 				CommandIndex: rf.logs[index].Index,
 			}
+			fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"),rf.me,"apply log",rf.lastApplied+1,"-",rf.logs[index].Index)
 			rf.applyCh <- msg
 		}
 	}
-	rf.lastApplied--
 }
 
 func (rf *Raft) appendEntries() {
@@ -423,7 +418,7 @@ func (rf *Raft) appendEntries() {
 	for i := 0; i < count; i++ {
 		go func(index int) {
 			defer wg.Done()
-			if i == rf.me {
+			if index == rf.me {
 				successedCnt++
 				return
 			}
@@ -541,36 +536,21 @@ func (rf *Raft) startLog(command interface{}) RespStart {
 		//设置term并插入log
 		resp.term = rf.currentTerm
 		resp.index = rf.insertLog(command)
-		fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "leader :", rf.me, "append log", resp.term, resp.index)
+		fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "leader", rf.me,":", "append log", resp.term,"-",resp.index)
 		//同步log给fallow
 		rf.appendEntries()
 	}
 	return resp
 }
 
-//
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election. even if the Raft instance has been killed,
-// this function should return gracefully.
-//
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
-//
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-
 	rf.startLogChan <- command
 	rst := <-rf.respStartLogChan
 	return rst.index, rst.term, rst.isLeader
 }
 
 func (rf *Raft) Kill() {
-	fmt.Println("kill")
+	fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"),rf.me,"kill")
 	close(rf.killChan)
 }
 
