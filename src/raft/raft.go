@@ -111,9 +111,9 @@ type Raft struct {
 	killChan         chan (int)              //退出节点
 	voteChan         chan (RequestVoteArgs)  //投票
 	voteRstChan      chan (RequestVoteReply) //投票结果
-	entriesChan      chan (AppendEntries)    //投票
-	entriesRstChan   chan (RespEntries)      //投票结果
-	startLogChan     chan (interface{})
+	onEntriesChan    chan (AppendEntries)    //被leader同步日志
+	onEntriesRstChan chan (RespEntries)      //同步日志结果
+	startLogChan     chan (interface{})      //试图start log
 	respStartLogChan chan (RespStart)
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -319,8 +319,8 @@ func (rf *Raft) Vote() {
 }
 
 func (rf *Raft) RequestAppendEntries(req *AppendEntries, resp *RespEntries) {
-	rf.entriesChan <- *req
-	*resp = <-rf.entriesRstChan
+	rf.onEntriesChan <- *req
+	*resp = <-rf.onEntriesRstChan
 }
 
 func (rf *Raft) updateLog(index int, log LogEntry) {
@@ -378,7 +378,6 @@ func (rf *Raft) OnAppendEntries(req *AppendEntries) RespEntries {
 
 func (rf *Raft) getEntriesInfo(index int, entries *[]LogEntry) (preterm int, preindex int) {
 	pre := index - 1
-
 	//即fallow 日志为空
 	if pre < 0 {
 		preterm = -1
@@ -403,72 +402,94 @@ func (rf *Raft) apply() {
 				Command:      rf.logs[index].Log,
 				CommandIndex: rf.logs[index].Index,
 			}
-			fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"),rf.me,"apply log",rf.lastApplied+1,"-",rf.logs[index].Index)
+			fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me, "apply log", rf.lastApplied+1, "-", rf.logs[index].Index)
 			rf.applyCh <- msg
 		}
 	}
 }
 
-func (rf *Raft) appendEntries() {
-	successedCnt := 0
+func (rf *Raft) waitForAppendEntries(servers []int) []int {
+	var successPeers []int
 	term := 0
-	count := len(rf.peers)
+	count := len(servers)
 	var wg sync.WaitGroup
 	wg.Add(count)
 	for i := 0; i < count; i++ {
 		go func(index int) {
 			defer wg.Done()
 			if index == rf.me {
-				successedCnt++
+				successPeers = append(successPeers, index)
 				return
 			}
-			req := AppendEntries{
-				Me:           rf.me,
-				Term:         rf.currentTerm,
-				LeaderCommit: rf.commitIndex,
-			}
-			resp := RespEntries{Term: 0}
-			//当前fallow的日志状态
-			next := rf.nextIndex[index]
-			req.PrevLogTerm, req.PrevLogIndex = rf.getEntriesInfo(next, &req.Entries)
-			if len(req.Entries) > 0 {
-				fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "replicate log to ", index, " preterm", req.PrevLogTerm, " preindex", req.PrevLogIndex)
-			}
 
-			rst := rf.sendAppendEnteries(index, &req, &resp)
-
-			if rst {
-				//如果某个节点任期大于自己，则更新任期，变成fallow
-				if resp.Term > rf.currentTerm {
-					if resp.Term > term {
-						term = resp.Term
-					}
-					return
+			for {
+				req := AppendEntries{
+					Me:           rf.me,
+					Term:         rf.currentTerm,
+					LeaderCommit: rf.commitIndex,
 				}
-				//如果更新失败则fallow日志状态减1
-				if !resp.Successed {
-					if rf.nextIndex[index] > 0 {
-						rf.nextIndex[index]--
+				resp := RespEntries{Term: 0}
+				//当前fallow的日志状态
+				next := rf.nextIndex[index]
+				req.PrevLogTerm, req.PrevLogIndex = rf.getEntriesInfo(next, &req.Entries)
+				if len(req.Entries) > 0 {
+					fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "replicate log to ", index, " preterm", req.PrevLogTerm, " preindex", req.PrevLogIndex)
+				}
+
+				rst := rf.sendAppendEnteries(index, &req, &resp)
+				if rst {
+					//如果某个节点任期大于自己，则更新任期，变成fallow
+					if resp.Term > rf.currentTerm {
+						if resp.Term > term {
+							term = resp.Term
+						}
+						break
+					}
+					//如果更新失败则fallow日志状态减1
+					if !resp.Successed {
+						if rf.nextIndex[index] > 0 {
+							rf.nextIndex[index]--
+						} else {
+							break
+						}
+					} else {
+						//更新成功
+						rf.nextIndex[index] += len(req.Entries)
+						successPeers = append(successPeers, index)
+						break
 					}
 				} else {
-					//更新成功
-					rf.nextIndex[index] += len(req.Entries)
-					successedCnt++
+					break
 				}
 			}
-		}(i)
+		}(servers[i])
 	}
 	wg.Wait()
 	//发现有更大term
 	if term > rf.currentTerm {
 		rf.currentTerm = term
 		rf.setStatus(Fallower)
+		successPeers = successPeers[0:0]
+	}
+	return successPeers
+}
+
+func (rf *Raft) appendEntries() {
+	if rf.status != Leader {
 		return
 	}
+	var input []int
+	for i := 0; i < len(rf.peers); i++ {
+		input = append(input, i)
+	}
+	//等待同步日志结果
+	rst := rf.waitForAppendEntries(input)
 	//日志提交成功
-	if successedCnt*2 > count {
+	if len(rst)*2 > len(rf.peers) {	
 		_, rf.commitIndex = rf.getLogTermAndIndex()
 		rf.apply()
+		//通知更新成功的节点apply
+		rf.waitForAppendEntries(rst)
 	}
 }
 
@@ -536,9 +557,7 @@ func (rf *Raft) startLog(command interface{}) RespStart {
 		//设置term并插入log
 		resp.term = rf.currentTerm
 		resp.index = rf.insertLog(command)
-		fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "leader", rf.me,":", "append log", resp.term,"-",resp.index)
-		//同步log给fallow
-		rf.appendEntries()
+		fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "leader", rf.me, ":", "append log", resp.term, "-", resp.index)
 	}
 	return resp
 }
@@ -550,7 +569,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func (rf *Raft) Kill() {
-	fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"),rf.me,"kill")
+	fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me, "kill")
 	close(rf.killChan)
 }
 
@@ -574,8 +593,8 @@ func (rf *Raft) MainLoop() {
 			rf.onCandidateTimeout()
 		case req := <-rf.voteChan:
 			rf.voteRstChan <- rf.onVote(&req)
-		case req := <-rf.entriesChan:
-			rf.entriesRstChan <- rf.OnAppendEntries(&req)
+		case req := <-rf.onEntriesChan:
+			rf.onEntriesRstChan <- rf.OnAppendEntries(&req)
 		case args := <-rf.startLogChan:
 			rf.respStartLogChan <- rf.startLog(args)
 		case <-rf.killChan:
@@ -612,8 +631,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.killChan = make(chan (int))
 	rf.voteChan = make(chan (RequestVoteArgs))
 	rf.voteRstChan = make(chan (RequestVoteReply))
-	rf.entriesChan = make(chan (AppendEntries))
-	rf.entriesRstChan = make(chan (RespEntries))
+	rf.onEntriesChan = make(chan (AppendEntries))
+	rf.onEntriesRstChan = make(chan (RespEntries))
 	rf.startLogChan = make(chan (interface{}))
 	rf.respStartLogChan = make(chan (RespStart))
 	//主循环
