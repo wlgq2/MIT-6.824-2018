@@ -34,10 +34,10 @@ const Fallower, Leader, Candidate int = 1, 2, 3
 const HeartbeatTimeoutCnt int64 = 3
 
 //心跳周期
-const HeartbeatDuration = time.Duration(time.Millisecond * 350)
+const HeartbeatDuration = time.Duration(time.Millisecond * 250)
 
 //竞选周期随机范围，毫秒。
-const CandidateDuration int = 300
+const CandidateDuration int = 200
 
 type ApplyMsg struct {
 	CommandValid bool
@@ -130,7 +130,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	}()
 	select {
 	case ok = <-rstChan:
-	case <-time.After(time.Millisecond * 750):
+	case <-time.After(time.Millisecond * 500):
 		//rpc调用超时
 	}
 	return ok
@@ -410,7 +410,7 @@ func (rf *Raft) apply() {
 
 func (rf *Raft) waitForAppendEntries(servers []int) []int {
 	var successPeers []int
-	term := 0
+	var terms []int
 	count := len(servers)
 	var wg sync.WaitGroup
 	wg.Add(count)
@@ -440,9 +440,8 @@ func (rf *Raft) waitForAppendEntries(servers []int) []int {
 				if rst {
 					//如果某个节点任期大于自己，则更新任期，变成fallow
 					if resp.Term > rf.currentTerm {
-						if resp.Term > term {
-							term = resp.Term
-						}
+						terms = append(terms,resp.Term)
+						rf.setStatus(Fallower)
 						break
 					}
 					//如果更新失败则fallow日志状态减1
@@ -466,9 +465,13 @@ func (rf *Raft) waitForAppendEntries(servers []int) []int {
 	}
 	wg.Wait()
 	//发现有更大term
-	if term > rf.currentTerm {
-		rf.currentTerm = term
-		rf.setStatus(Fallower)
+	if len(terms) > 0 {
+		for i:=0 ;i<len(terms);i++ {
+			if terms[i] > rf.currentTerm {
+				rf.currentTerm = terms[i]
+				rf.setStatus(Fallower)
+			}
+		}
 		successPeers = successPeers[0:0]
 	}
 	return successPeers
