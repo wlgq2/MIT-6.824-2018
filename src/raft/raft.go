@@ -5,7 +5,7 @@ import "labrpc"
 import "time"
 import "sync/atomic"
 import "math/rand"
-import "fmt"
+import "log"
 import "bytes"
 import "labgob"
 
@@ -197,7 +197,7 @@ func (rf *Raft) readPersist(data []byte) {
 		decoder.Decode(&lastApplied) != nil ||
 		decoder.Decode(&logs) != nil ||
 		decoder.Decode(&rf.logIndexs) != nil {
-		fmt.Println("Error in unmarshal raft state")
+		log.Println("Error in unmarshal raft state")
 	} else {
 
 		rf.currentTerm = currentTerm
@@ -244,7 +244,7 @@ func (rf *Raft) onVote(args *RequestVoteArgs) RequestVoteReply {
 func (rf *Raft) Vote() {
 	//投票先增大自身任期
 	atomic.AddInt64(&rf.currentTerm, 1)
-	fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "start vote :", rf.me, "term :", rf.currentTerm)
+	log.Println(time.Now().Format("2006-01-02 15:04:05.000"), "start vote :", rf.me, "term :", rf.currentTerm)
 	logterm, logindex := rf.getLogTermAndIndex()
 	req := RequestVoteArgs{
 		Me:           rf.me,
@@ -289,7 +289,7 @@ func (rf *Raft) Vote() {
 	}
 	//获得多数赞同则变成leader
 	if agreeVote*2 > peercnt {
-		fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me, "become leader.")
+		log.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me, "become leader.")
 		rf.setStatus(Leader)
 		rf.appendEntries()
 	}
@@ -300,14 +300,14 @@ func (rf *Raft) RequestAppendEntries(req *AppendEntries, resp *RespEntries) {
 	*resp = <-rf.onEntriesRstChan
 }
 
-func (rf *Raft) updateLog(index int, log LogEntry) {
+func (rf *Raft) updateLog(index int, logEntry LogEntry) {
 	if index < len(rf.logs) {
-		rf.logs[index] = log
+		rf.logs[index] = logEntry
 	} else {
-		rf.logs = append(rf.logs, log)
+		rf.logs = append(rf.logs, logEntry)
 	}
-	rf.logIndexs[log.Index] = index
-	fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me, " update log ", index, ":", log.Term, "-", log.Index)
+	rf.logIndexs[logEntry.Index] = index
+	log.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me, " update log ", index, ":", logEntry.Term, "-", logEntry.Index)
 }
 
 func (rf *Raft) OnAppendEntries(req *AppendEntries) RespEntries {
@@ -330,13 +330,13 @@ func (rf *Raft) OnAppendEntries(req *AppendEntries) RespEntries {
 	if req.PrevLogIndex >= 0 {
 		if index, ok = rf.logIndexs[req.PrevLogIndex]; !ok {
 			//改索引在自身日志中不存在，则拒绝更新
-			fmt.Println(rf.me, "can't find index", req.PrevLogIndex, "in maps")
+			log.Println(rf.me, "can't find index", req.PrevLogIndex, "in maps")
 			resp.Successed = false
 			return resp
 		}
 		if rf.logs[index].Term != req.PrevLogTerm {
 			//该索引与自身日志不同，则拒绝更新
-			fmt.Println(rf.me, "term error", req.PrevLogTerm, rf.logs[index].Term)
+			log.Println(rf.me, "term error", req.PrevLogTerm, rf.logs[index].Term)
 			resp.Successed = false
 			return resp
 		}
@@ -379,7 +379,7 @@ func (rf *Raft) apply() {
 				Command:      rf.logs[index].Log,
 				CommandIndex: rf.logs[index].Index,
 			}
-			fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me, "apply log", index, "-", rf.logs[index].Index)
+			log.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me, "apply log", index, "-", rf.logs[index].Index)
 			rf.applyCh <- msg
 		}
 	}
@@ -410,7 +410,7 @@ func (rf *Raft) waitForAppendEntries(servers []int) []int {
 				next := rf.nextIndex[index]
 				req.PrevLogTerm, req.PrevLogIndex = rf.getEntriesInfo(next, &req.Entries)
 				if len(req.Entries) > 0 {
-					fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "replicate log to ", index, " preterm", req.PrevLogTerm, " preindex", req.PrevLogIndex)
+					log.Println(time.Now().Format("2006-01-02 15:04:05.000"), "replicate log to ", index, " preterm", req.PrevLogTerm, " preindex", req.PrevLogIndex)
 				}
 
 				rst := rf.sendAppendEnteries(index, &req, &resp)
@@ -537,7 +537,7 @@ func (rf *Raft) startLog(command interface{}) RespStart {
 		//设置term并插入log
 		resp.term = rf.currentTerm
 		resp.index = rf.insertLog(command)
-		fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "leader", rf.me, ":", "append log", resp.term, "-", resp.index)
+		log.Println(time.Now().Format("2006-01-02 15:04:05.000"), "leader", rf.me, ":", "append log", resp.term, "-", resp.index)
 	}
 	return resp
 }
