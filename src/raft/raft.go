@@ -1,34 +1,16 @@
 package raft
 
-//
-// this is an outline of the API that raft must expose to
-// the service (or tester). see comments below for
-// each of these functions for more details.
-//
-// rf = Make(...)
-//   create a new Raft server.
-// rf.Start(command interface{}) (index, term, isleader)
-//   start agreement on a new log entry
-// rf.GetState() (term, isLeader)
-//   ask a Raft for its current term, and whether it thinks it is leader
-// ApplyMsg
-//   each time a new entry is committed to the log, each Raft peer
-//   should send an ApplyMsg to the service (or tester)
-//   in the same server.
-//
-
 import "sync"
 import "labrpc"
 import "time"
 import "sync/atomic"
 import "math/rand"
 import "fmt"
-
-// import "bytes"
-// import "labgob"
+import "bytes"
+import "labgob"
 
 //节点状态
-const Fallower, Leader, Candidate int = 1, 2, 3
+const Fallower, Leader, Candidate int64 = 1, 2, 3
 
 //心跳超时阈值
 const HeartbeatTimeoutCnt int64 = 3
@@ -47,7 +29,7 @@ type ApplyMsg struct {
 
 //日志
 type LogEntry struct {
-	Term  int
+	Term  int64
 	Index int
 	Log   interface{}
 }
@@ -55,22 +37,22 @@ type LogEntry struct {
 //投票请求
 type RequestVoteArgs struct {
 	Me           int
-	ElectionTerm int
+	ElectionTerm int64
 	LogIndex     int
-	LogTerm      int
+	LogTerm      int64
 }
 
 //投票rpc返回
 type RequestVoteReply struct {
 	IsAgree     bool
-	CurrentTerm int
+	CurrentTerm int64
 }
 
 //日志复制请求
 type AppendEntries struct {
 	Me           int
-	Term         int
-	PrevLogTerm  int
+	Term         int64
+	PrevLogTerm  int64
 	PrevLogIndex int
 	Entries      []LogEntry
 	LeaderCommit int
@@ -78,12 +60,12 @@ type AppendEntries struct {
 
 //回复日志更新请求
 type RespEntries struct {
-	Term      int
+	Term      int64
 	Successed bool
 }
 
 type RespStart struct {
-	term     int
+	term     int64
 	index    int
 	isLeader bool
 }
@@ -99,8 +81,8 @@ type Raft struct {
 	commitIndex    int                 //当前日志提交处
 	lastApplied    int                 //当前状态机执行处
 	heartBeatCnt   int64               // 心跳计数
-	status         int                 //节点状态
-	currentTerm    int                 //当前周期
+	status         int64               //节点状态
+	currentTerm    int64               //当前周期
 	heartbeatTimer *time.Timer         //心跳定时器
 	candidateTimer *time.Timer         //竞选超时定时器
 	randtime       *rand.Rand          //随机数，用于随机竞选周期，避免节点间竞争。
@@ -115,10 +97,6 @@ type Raft struct {
 	onEntriesRstChan chan (RespEntries)      //同步日志结果
 	startLogChan     chan (interface{})      //试图start log
 	respStartLogChan chan (RespStart)
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
-
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
@@ -154,12 +132,12 @@ func (rf *Raft) sendAppendEnteries(server int, req *AppendEntries, resp *RespEnt
 func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
-	term = rf.currentTerm
+	term = int(rf.currentTerm)
 	isleader = rf.status == Leader
 	return term, isleader
 }
 
-func (rf *Raft) setStatus(status int) {
+func (rf *Raft) setStatus(status int64) {
 	//设置节点状态，变换为fallow时候重置选举定时器
 	if (rf.status != Fallower) && (status == Fallower) {
 		rf.resetCandidateTimer()
@@ -177,14 +155,14 @@ func (rf *Raft) setStatus(status int) {
 			}
 		}
 	}
-	rf.status = status
+	atomic.StoreInt64(&rf.status, status)
 
 }
 
 //获取日志索引及任期
-func (rf *Raft) getLogTermAndIndex() (int, int) {
+func (rf *Raft) getLogTermAndIndex() (int64, int) {
 	index := 0
-	term := 0
+	term := int64(0)
 	size := len(rf.logs)
 	if size > 0 {
 		index = rf.logs[size-1].Index
@@ -193,42 +171,41 @@ func (rf *Raft) getLogTermAndIndex() (int, int) {
 	return term, index
 }
 
-//
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-//
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	writer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(writer)
+	encoder.Encode(rf.currentTerm)
+	encoder.Encode(rf.commitIndex)
+	encoder.Encode(rf.lastApplied)
+	encoder.Encode(rf.logs)
+	encoder.Encode(rf.logIndexs)
+	data := writer.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
-//
-// restore previously persisted state.
-//
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if data == nil || len(data) < 1 {
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	reader := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(reader)
+	var commitIndex, lastApplied int
+	var currentTerm int64
+	var logs []LogEntry
+	if decoder.Decode(&currentTerm) != nil ||
+		decoder.Decode(&commitIndex) != nil ||
+		decoder.Decode(&lastApplied) != nil ||
+		decoder.Decode(&logs) != nil ||
+		decoder.Decode(&rf.logIndexs) != nil {
+		fmt.Println("Error in unmarshal raft state")
+	} else {
+
+		rf.currentTerm = currentTerm
+		rf.commitIndex = commitIndex
+		rf.lastApplied = lastApplied
+		rf.logs = logs
+	}
+
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -266,7 +243,7 @@ func (rf *Raft) onVote(args *RequestVoteArgs) RequestVoteReply {
 
 func (rf *Raft) Vote() {
 	//投票先增大自身任期
-	rf.currentTerm++
+	atomic.AddInt64(&rf.currentTerm, 1)
 	fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), "start vote :", rf.me, "term :", rf.currentTerm)
 	logterm, logindex := rf.getLogTermAndIndex()
 	req := RequestVoteArgs{
@@ -376,7 +353,7 @@ func (rf *Raft) OnAppendEntries(req *AppendEntries) RespEntries {
 
 }
 
-func (rf *Raft) getEntriesInfo(index int, entries *[]LogEntry) (preterm int, preindex int) {
+func (rf *Raft) getEntriesInfo(index int, entries *[]LogEntry) (preterm int64, preindex int) {
 	pre := index - 1
 	//即fallow 日志为空
 	if pre < 0 {
@@ -402,7 +379,7 @@ func (rf *Raft) apply() {
 				Command:      rf.logs[index].Log,
 				CommandIndex: rf.logs[index].Index,
 			}
-			fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me, "apply log", rf.lastApplied+1, "-", rf.logs[index].Index)
+			fmt.Println(time.Now().Format("2006-01-02 15:04:05.000"), rf.me, "apply log", index, "-", rf.logs[index].Index)
 			rf.applyCh <- msg
 		}
 	}
@@ -410,7 +387,7 @@ func (rf *Raft) apply() {
 
 func (rf *Raft) waitForAppendEntries(servers []int) []int {
 	var successPeers []int
-	var terms []int
+	var terms []int64
 	count := len(servers)
 	var wg sync.WaitGroup
 	wg.Add(count)
@@ -440,7 +417,7 @@ func (rf *Raft) waitForAppendEntries(servers []int) []int {
 				if rst {
 					//如果某个节点任期大于自己，则更新任期，变成fallow
 					if resp.Term > rf.currentTerm {
-						terms = append(terms,resp.Term)
+						terms = append(terms, resp.Term)
 						rf.setStatus(Fallower)
 						break
 					}
@@ -466,7 +443,7 @@ func (rf *Raft) waitForAppendEntries(servers []int) []int {
 	wg.Wait()
 	//发现有更大term
 	if len(terms) > 0 {
-		for i:=0 ;i<len(terms);i++ {
+		for i := 0; i < len(terms); i++ {
 			if terms[i] > rf.currentTerm {
 				rf.currentTerm = terms[i]
 				rf.setStatus(Fallower)
@@ -488,7 +465,7 @@ func (rf *Raft) appendEntries() {
 	//等待同步日志结果
 	rst := rf.waitForAppendEntries(input)
 	//日志提交成功
-	if len(rst)*2 > len(rf.peers) {	
+	if len(rst)*2 > len(rf.peers) {
 		_, rf.commitIndex = rf.getLogTermAndIndex()
 		rf.apply()
 		//通知更新成功的节点apply
@@ -568,7 +545,7 @@ func (rf *Raft) startLog(command interface{}) RespStart {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.startLogChan <- command
 	rst := <-rf.respStartLogChan
-	return rst.index, rst.term, rst.isLeader
+	return rst.index, int(rst.term), rst.isLeader
 }
 
 func (rf *Raft) Kill() {
@@ -581,7 +558,7 @@ func (rf *Raft) MainLoop() {
 	rf.heartbeatTimer = time.NewTimer(HeartbeatDuration)
 	//选举超时定时器
 	rf.candidateTimer = time.NewTimer(time.Duration(0))
-	rf.resetCandidateTimer()
+	rf.setStatus(Fallower)
 	defer func() {
 		rf.heartbeatTimer.Stop()
 		rf.candidateTimer.Stop()
@@ -600,8 +577,10 @@ func (rf *Raft) MainLoop() {
 		case args := <-rf.startLogChan:
 			rf.respStartLogChan <- rf.startLog(args)
 		case <-rf.killChan:
+			rf.persist()
 			return
 		}
+		rf.persist()
 	}
 }
 
@@ -622,9 +601,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
-	rf.status = Fallower
-	rf.currentTerm = 0
+	atomic.StoreInt64(&rf.currentTerm, 0)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
@@ -637,12 +614,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.onEntriesRstChan = make(chan (RespEntries))
 	rf.startLogChan = make(chan (interface{}))
 	rf.respStartLogChan = make(chan (RespStart))
+
+	rf.readPersist(persister.ReadRaftState())
+	rf.apply()
 	//主循环
 	go rf.MainLoop()
-	// Your initialization code here (2A, 2B, 2C).
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-
 	return rf
 }
