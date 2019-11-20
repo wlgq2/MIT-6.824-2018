@@ -9,6 +9,7 @@ import "bytes"
 import "labgob"
 import "runtime"
 import "strconv"
+import "sort"
 
 //节点状态
 const Fallower, Leader, Candidate int = 1, 2, 3
@@ -70,7 +71,6 @@ type Raft struct {
 	persister       *Persister          // Object to hold this peer's persisted state
 	me              int                 // 自己服务编号
 	logs            []LogEntry          // 日志存储
-	logIndexs       map[int]int         //记录日志所在位置索引，用于减少查找日志时间复杂度，空间换时间
 	commitIndex     int                 //当前日志提交处
 	lastApplied     int                 //当前状态机执行处
 	status          int                 //节点状态
@@ -84,6 +84,7 @@ type Raft struct {
 	applyCh    chan ApplyMsg //状态机apply
 	isKilled   bool          //节点退出
 }
+
 func (rf *Raft) lock(info string) {
 	//log.Println(GetGID(), rf.me, "try lock", info)
 	rf.mu.Lock()
@@ -143,6 +144,8 @@ func (rf *Raft) getLogTermAndIndex() (int, int) {
 	}
 	return term, index
 }
+
+//获取协程ID
 func GetGID() uint64 {
 	b := make([]byte, 64)
 	b = b[:runtime.Stack(b, false)]
@@ -159,7 +162,6 @@ func (rf *Raft) persist() {
 	encoder.Encode(rf.commitIndex)
 	encoder.Encode(rf.lastApplied)
 	encoder.Encode(rf.logs)
-	encoder.Encode(rf.logIndexs)
 	data := writer.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -175,8 +177,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if decoder.Decode(&currentTerm) != nil ||
 		decoder.Decode(&commitIndex) != nil ||
 		decoder.Decode(&lastApplied) != nil ||
-		decoder.Decode(&logs) != nil ||
-		decoder.Decode(&rf.logIndexs) != nil {
+		decoder.Decode(&logs) != nil {
 		log.Println("Error in unmarshal raft state")
 	} else {
 
@@ -198,10 +199,8 @@ func (rf *Raft) setStatus(status int) {
 	//节点变为leader，则初始化fallow日志状态
 	if rf.status != Leader && status == Leader {
 		index := len(rf.logs)
-		rf.nextIndex = make([]int, len(rf.peers))
-		rf.matchIndex = make([]int, len(rf.peers))
 		for i := 0; i < len(rf.peers); i++ {
-			rf.nextIndex[i] = index
+			rf.nextIndex[i] = index + 1
 			rf.matchIndex[i] = 0
 		}
 	}
@@ -337,44 +336,60 @@ func (rf *Raft) updateLog(index int, logEntry LogEntry) {
 	} else {
 		rf.logs = append(rf.logs, logEntry)
 	}
-	rf.logIndexs[logEntry.Index] = index
 	log.Println(rf.me, " update log ", index, ":", logEntry.Term, "-", logEntry.Index)
 }
 
 func (rf *Raft) getEntriesInfo(index int, entries *[]LogEntry) (preterm int, preindex int) {
 	pre := index - 1
-	//即fallow 日志为空
-	if pre < 0 {
-		preterm = -1
-		preindex = -1
+	if pre == 0 {
+		preindex = 0
+		preterm = 0
 	} else {
 		preindex = rf.logs[pre].Index
 		preterm = rf.logs[pre].Term
 	}
-	for i := index; i < len(rf.logs); i++ {
+	for i := pre; i < len(rf.logs); i++ {
 		*entries = append(*entries, rf.logs[i])
 	}
 	return
 }
 
-//apply 状态机
-func (rf *Raft) apply() {
-	if rf.status == Fallower {
-		_, last := rf.getLogTermAndIndex()
-		for ; rf.lastApplied < rf.commitIndex && rf.lastApplied < last; rf.lastApplied++ {
-			if index, ok := rf.logIndexs[rf.lastApplied+1]; ok {
-				msg := ApplyMsg{
-					CommandValid: true,
-					Command:      rf.logs[index].Log,
-					CommandIndex: rf.logs[index].Index,
-				}
-				log.Println(rf.me, "apply log", index, "-", rf.logs[index].Index)
-				rf.applyCh <- msg
-			}
-		}
-	} else if rf.status == Leader {
-
+//获取当前已被提交日志
+func (rf *Raft) updateCommitIndex() bool {
+	rst := false
+	var indexs []int
+	_, rf.matchIndex[rf.me] = rf.getLogTermAndIndex()
+	for i := 0; i < len(rf.matchIndex); i++ {
+		indexs = append(indexs, rf.matchIndex[i])
 	}
+	sort.Ints(indexs)
+	index := len(indexs) / 2
+	commit := indexs[index]
+	if commit > rf.commitIndex {
+		rst = true
+		rf.commitIndex = commit
+	}
+	return rst
+}
+
+//apply 状态机
+func (rf *Raft) apply() bool {
+	notifyFallower := false
+	if rf.status == Leader {
+		notifyFallower = rf.updateCommitIndex()
+	}
+	_, last := rf.getLogTermAndIndex()
+	for ; rf.lastApplied < rf.commitIndex && rf.lastApplied < last; rf.lastApplied++ {
+		index := rf.lastApplied
+		msg := ApplyMsg{
+			CommandValid: true,
+			Command:      rf.logs[index].Log,
+			CommandIndex: rf.logs[index].Index,
+		}
+		log.Println(rf.me, "apply log", index, "-", rf.logs[index].Index)
+		rf.applyCh <- msg
+	}
+	return notifyFallower
 }
 
 func (rf *Raft) insertLog(command interface{}) int {
@@ -387,7 +402,6 @@ func (rf *Raft) insertLog(command interface{}) int {
 	_, index := rf.getLogTermAndIndex()
 	index++
 	entry.Index = index
-	rf.logIndexs[index] = len(rf.logs)
 	//插入log
 	rf.logs = append(rf.logs, entry)
 	return index
@@ -408,18 +422,14 @@ func (rf *Raft) RequestAppendEntries(req *AppendEntries, resp *RespEntries) {
 	rf.currentTerm = req.Term
 	rf.setStatus(Fallower)
 	//判定与leader日志是一致
-	index := -1
-	ok := true
-	if req.PrevLogIndex >= 0 {
-		if index, ok = rf.logIndexs[req.PrevLogIndex]; !ok {
-			//该索引在自身日志中不存在，则拒绝更新
-			log.Println(rf.me, "can't find index", req.PrevLogIndex, "in maps")
-			resp.Successed = false
-			return
+	if req.PrevLogIndex > 0 {
+		if req.PrevLogIndex >= len(rf.logs) {
+			//没有该日志，则拒绝更新
+			log.Println(rf.me, "can't find preindex", req.PrevLogTerm)
 		}
-		if rf.logs[index].Term != req.PrevLogTerm {
+		if rf.logs[req.PrevLogIndex].Term != req.PrevLogTerm {
 			//该索引与自身日志不同，则拒绝更新
-			log.Println(rf.me, "term error", req.PrevLogTerm, rf.logs[index].Term)
+			log.Println(rf.me, "term error", req.PrevLogTerm)
 			resp.Successed = false
 			return
 		}
@@ -430,7 +440,7 @@ func (rf *Raft) RequestAppendEntries(req *AppendEntries, resp *RespEntries) {
 		log.Println(rf.me, "update log from ", req.Me)
 	}
 	for i := 0; i < size; i++ {
-		rf.updateLog(index+i+1, req.Entries[i])
+		rf.updateLog(req.PrevLogIndex+i+1, req.Entries[i])
 	}
 	/*
 		//删除不同步索引
@@ -476,14 +486,14 @@ func (rf *Raft) replicateLogTo(peer int) (rst bool) {
 				log.Println(rf.me, "become fallow ", peer, "term :", resp.Term)
 				rf.setStatus(Fallower)
 			} else if !resp.Successed { //如果更新失败则fallow日志状态减1
-				if rf.nextIndex[peer] > 0 {
+				if rf.nextIndex[peer] > 1 {
 					rf.nextIndex[peer]--
 					log.Println(rf.me, "to", peer, "replicate log error", rf.nextIndex[peer])
 					isLoop = true
 				}
 			} else { //更新成功
-				rf.nextIndex[peer] += len(req.Entries)
-				rf.matchIndex[peer] = rf.nextIndex[peer] - 1
+				rf.nextIndex[peer] = req.Entries[len(req.Entries)-1].Index + 1
+				rf.matchIndex[peer] = req.Entries[len(req.Entries)-1].Index
 				rst = true
 			}
 		} else {
@@ -513,8 +523,11 @@ func (rf *Raft) ReplicateLogLoop(peer int) {
 			success := rf.replicateLogTo(peer)
 			if success {
 				rf.lock("Raft.ReplicateLogLoop")
-				rf.apply()
+				notify := rf.apply()
 				rf.unlock("Raft.ReplicateLogLoop")
+				if notify {
+					rf.replicateLogTo(peer)
+				}
 			}
 		}
 		rf.heartbeatTimers[peer].Reset(HeartbeatDuration)
@@ -524,7 +537,7 @@ func (rf *Raft) ReplicateLogLoop(peer int) {
 func (rf *Raft) Start(command interface{}) (term int, index int, isLeader bool) {
 	rf.lock("Raft.Start")
 	defer rf.unlock("Raft.Start")
-	term = -1
+	term = 0
 	index = -1
 	isLeader = rf.status == Leader
 
@@ -554,10 +567,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
 	rf.randtime = rand.New(rand.NewSource(time.Now().UnixNano() + int64(rf.me)))
-	rf.logIndexs = make(map[int]int)
 	rf.isKilled = false
 	rf.heartbeatTimers = make([]*time.Timer, len(rf.peers))
 	rf.eletionTimer = time.NewTimer(CandidateDuration)
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
 	rf.setStatus(Fallower)
 
 	//日志同步协程
