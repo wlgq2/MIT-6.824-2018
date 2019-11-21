@@ -243,7 +243,7 @@ func (rf *Raft) updateLog(index int, logEntrys []LogEntry) {
 	defer rf.unlock("Raft.updateLog")
 	for i := 0; i < len(logEntrys); i++ {
 		if index+i < len(rf.logs) {
-			rf.logs[ index+i] = logEntrys[i]
+			rf.logs[index+i] = logEntrys[i]
 		} else {
 			rf.logs = append(rf.logs, logEntrys[i])
 		}
@@ -271,7 +271,7 @@ func (rf *Raft) insertLog(command interface{}) int {
 func (rf *Raft) updateCommitIndex() bool {
 	rst := false
 	var indexs []int
-	rf.matchIndex[rf.me] =0
+	rf.matchIndex[rf.me] = 0
 	if len(rf.logs) > 0 {
 		rf.matchIndex[rf.me] = rf.logs[len(rf.logs)-1].Index
 	}
@@ -333,6 +333,8 @@ func GetGID() uint64 {
 }
 
 func (rf *Raft) persist() {
+	rf.lock("Raft.persist")
+	defer rf.unlock("Raft.persist")
 	writer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(writer)
 	encoder.Encode(rf.currentTerm)
@@ -344,6 +346,8 @@ func (rf *Raft) persist() {
 }
 
 func (rf *Raft) readPersist(data []byte) {
+	rf.lock("Raft.readPersist")
+	defer rf.unlock("Raft.readPersist")
 	if data == nil || len(data) < 1 {
 		return
 	}
@@ -362,9 +366,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.commitIndex = commitIndex
 		rf.lastApplied = lastApplied
 		rf.logs = logs
-		rf.apply()
 	}
-
 }
 
 func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
@@ -512,6 +514,7 @@ func (rf *Raft) RequestAppendEntries(req *AppendEntries, resp *RespEntries) {
 	}
 	rf.setCommitIndex(req.LeaderCommit)
 	rf.apply()
+	rf.persist()
 	return
 }
 
@@ -576,6 +579,7 @@ func (rf *Raft) ReplicateLogLoop(peer int) {
 			if success {
 				rf.apply()
 				rf.replicateLogNow()
+				rf.persist()
 			}
 		}
 		rf.heartbeatTimers[peer].Reset(HeartbeatDuration)
@@ -624,6 +628,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		go rf.ReplicateLogLoop(i)
 	}
 	rf.readPersist(persister.ReadRaftState())
+	rf.apply()
 	raftOnce.Do(func() {
 		//filename :=  "log"+time.Now().Format("2006-01-02 15_04_05") +".txt"
 		//file, _ := os.OpenFile(filename, os.O_RDWR | os.O_CREATE | os.O_APPEND, 0666)
