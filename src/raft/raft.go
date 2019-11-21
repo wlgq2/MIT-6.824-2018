@@ -426,6 +426,8 @@ func (rf *Raft) RequestAppendEntries(req *AppendEntries, resp *RespEntries) {
 		if req.PrevLogIndex > len(rf.logs) {
 			//没有该日志，则拒绝更新
 			log.Println(rf.me, "can't find preindex", req.PrevLogTerm)
+			resp.Successed = false
+			return
 		}
 		if rf.logs[req.PrevLogIndex-1].Term != req.PrevLogTerm {
 			//该索引与自身日志不同，则拒绝更新
