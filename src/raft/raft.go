@@ -345,8 +345,8 @@ func (rf *Raft) getEntriesInfo(index int, entries *[]LogEntry) (preterm int, pre
 		preindex = 0
 		preterm = 0
 	} else {
-		preindex = rf.logs[pre].Index
-		preterm = rf.logs[pre].Term
+		preindex = rf.logs[pre-1].Index
+		preterm = rf.logs[pre-1].Term
 	}
 	for i := pre; i < len(rf.logs); i++ {
 		*entries = append(*entries, rf.logs[i])
@@ -366,6 +366,7 @@ func (rf *Raft) updateCommitIndex() bool {
 	index := len(indexs) / 2
 	commit := indexs[index]
 	if commit > rf.commitIndex {
+		log.Println(rf.me, "update leader commit index", commit)
 		rst = true
 		rf.commitIndex = commit
 	}
@@ -373,10 +374,9 @@ func (rf *Raft) updateCommitIndex() bool {
 }
 
 //apply 状态机
-func (rf *Raft) apply() bool {
-	notifyFallower := false
+func (rf *Raft) apply()  {
 	if rf.status == Leader {
-		notifyFallower = rf.updateCommitIndex()
+		rf.updateCommitIndex()
 	}
 	_, last := rf.getLogTermAndIndex()
 	for ; rf.lastApplied < rf.commitIndex && rf.lastApplied < last; rf.lastApplied++ {
@@ -386,10 +386,10 @@ func (rf *Raft) apply() bool {
 			Command:      rf.logs[index].Log,
 			CommandIndex: rf.logs[index].Index,
 		}
-		log.Println(rf.me, "apply log", index, "-", rf.logs[index].Index)
+		log.Println(rf.me, "apply log", index, rf.logs[index].Term,"-", rf.logs[index].Index)
+		log.Println(rf.me, "apply logint", rf.logs[index].Log.(int))
 		rf.applyCh <- msg
 	}
-	return notifyFallower
 }
 
 func (rf *Raft) insertLog(command interface{}) int {
@@ -423,11 +423,11 @@ func (rf *Raft) RequestAppendEntries(req *AppendEntries, resp *RespEntries) {
 	rf.setStatus(Fallower)
 	//判定与leader日志是一致
 	if req.PrevLogIndex > 0 {
-		if req.PrevLogIndex >= len(rf.logs) {
+		if req.PrevLogIndex > len(rf.logs) {
 			//没有该日志，则拒绝更新
 			log.Println(rf.me, "can't find preindex", req.PrevLogTerm)
 		}
-		if rf.logs[req.PrevLogIndex].Term != req.PrevLogTerm {
+		if rf.logs[req.PrevLogIndex-1].Term != req.PrevLogTerm {
 			//该索引与自身日志不同，则拒绝更新
 			log.Println(rf.me, "term error", req.PrevLogTerm)
 			resp.Successed = false
@@ -440,7 +440,7 @@ func (rf *Raft) RequestAppendEntries(req *AppendEntries, resp *RespEntries) {
 		log.Println(rf.me, "update log from ", req.Me)
 	}
 	for i := 0; i < size; i++ {
-		rf.updateLog(req.PrevLogIndex+i+1, req.Entries[i])
+		rf.updateLog(req.PrevLogIndex+i, req.Entries[i])
 	}
 	/*
 		//删除不同步索引
@@ -456,10 +456,10 @@ func (rf *Raft) RequestAppendEntries(req *AppendEntries, resp *RespEntries) {
 	return
 }
 
-func (rf *Raft) replicateLogTo(peer int) (rst bool) {
-	rst = false
+func (rf *Raft) replicateLogTo(peer int) bool {
+	replicateRst := false
 	if peer == rf.me {
-		return rst
+		return replicateRst
 	}
 	isLoop := true
 	for rf.status == Leader && isLoop && !rf.isKilled {
@@ -492,16 +492,18 @@ func (rf *Raft) replicateLogTo(peer int) (rst bool) {
 					isLoop = true
 				}
 			} else { //更新成功
-				rf.nextIndex[peer] = req.Entries[len(req.Entries)-1].Index + 1
-				rf.matchIndex[peer] = req.Entries[len(req.Entries)-1].Index
-				rst = true
+				if len(req.Entries) > 0 {
+					rf.nextIndex[peer] = req.Entries[len(req.Entries)-1].Index + 1
+					rf.matchIndex[peer] = req.Entries[len(req.Entries)-1].Index
+					replicateRst = true
+				}
 			}
 		} else {
 			isLoop = true
 		}
 		rf.unlock("Raft.RequestAppendEntries")
 	}
-	return rst
+	return replicateRst
 }
 
 func (rf *Raft) replicateLogNow() {
@@ -523,22 +525,20 @@ func (rf *Raft) ReplicateLogLoop(peer int) {
 			success := rf.replicateLogTo(peer)
 			if success {
 				rf.lock("Raft.ReplicateLogLoop")
-				notify := rf.apply()
+				rf.apply()
 				rf.unlock("Raft.ReplicateLogLoop")
-				if notify {
-					rf.replicateLogTo(peer)
-				}
+				rf.replicateLogNow()
 			}
 		}
 		rf.heartbeatTimers[peer].Reset(HeartbeatDuration)
 	}
 }
 
-func (rf *Raft) Start(command interface{}) (term int, index int, isLeader bool) {
+func (rf *Raft) Start(command interface{}) (index int,term int, isLeader bool) {
 	rf.lock("Raft.Start")
 	defer rf.unlock("Raft.Start")
 	term = 0
-	index = -1
+	index = 0
 	isLeader = rf.status == Leader
 
 	if isLeader {
@@ -546,6 +546,7 @@ func (rf *Raft) Start(command interface{}) (term int, index int, isLeader bool) 
 		term = rf.currentTerm
 		index = rf.insertLog(command)
 		log.Println("leader", rf.me, ":", "append log", term, "-", index)
+		rf.replicateLogNow()
 	}
 	return
 }
