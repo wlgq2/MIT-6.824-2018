@@ -113,17 +113,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) sendAppendEnteries(server int, req *AppendEntries, resp *RespEntries) bool {
-	rstChan := make(chan (bool))
-	ok := false
-	go func() {
-		rst := rf.peers[server].Call("Raft.RequestAppendEntries", req, resp)
-		rstChan <- rst
-	}()
-	select {
-	case ok = <-rstChan:
-	case <-time.After(200):
-		//rpc调用超时
-	}
+	ok := rf.peers[server].Call("Raft.RequestAppendEntries", req, resp)
 	return ok
 }
 
