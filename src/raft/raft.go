@@ -248,6 +248,8 @@ func (rf *Raft) updateLog(index int, logEntrys []LogEntry) {
 			rf.logs = append(rf.logs, logEntrys[i])
 		}
 	}
+	//重置log大小
+	rf.logs = rf.logs[:index+len(logEntrys)]
 }
 
 func (rf *Raft) insertLog(command interface{}) int {
