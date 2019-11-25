@@ -106,14 +106,23 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	}()
 	select {
 	case ok = <-rstChan:
-	case <-time.After(time.Millisecond * 700):
+	case <-time.After(HeartbeatDuration):
 		//rpc调用超时
 	}
 	return ok
 }
 
 func (rf *Raft) sendAppendEnteries(server int, req *AppendEntries, resp *RespEntries) bool {
-	ok := rf.peers[server].Call("Raft.RequestAppendEntries", req, resp)
+	rstChan := make(chan (bool))
+	ok := false
+	go func() {
+		rst := rf.peers[server].Call("Raft.RequestAppendEntries", req, resp)
+		rstChan <- rst
+	}()
+	select {
+	case ok = <-rstChan:
+	case <-time.After(time.Millisecond * 400):
+	}
 	return ok
 }
 
@@ -390,6 +399,9 @@ func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.IsAgree = false
 	} else if logterm == req.LogTerm {
 		reply.IsAgree = logindex <= req.LogIndex
+		if !reply.IsAgree {
+			log.Println(rf.me, "refuse", req.Me, "because of logs's index")
+		}
 	}
 	if reply.IsAgree {
 		log.Println(rf.me, "agree", req.Me)
@@ -450,18 +462,6 @@ func (rf *Raft) Vote() {
 	}
 }
 
-func (rf *Raft) onElectionTimeout() {
-	if rf.getStatus() == Candidate {
-		//如果状态为竞选者，则直接发动投票
-		rf.resetCandidateTimer()
-		rf.Vote()
-	} else if rf.getStatus() == Fallower {
-		//如果状态为fallow，则转变为candidata并发动投票
-		rf.setStatus(Candidate)
-		rf.resetCandidateTimer()
-		rf.Vote()
-	}
-}
 
 //主轮询loop
 func (rf *Raft) ElectionLoop() {
@@ -474,7 +474,16 @@ func (rf *Raft) ElectionLoop() {
 		if rf.isKilled {
 			break
 		}
-		rf.onElectionTimeout()
+		if rf.getStatus() == Candidate {
+			//如果状态为竞选者，则直接发动投票
+			rf.resetCandidateTimer()
+			rf.Vote()
+		} else if rf.getStatus() == Fallower {
+			//如果状态为fallow，则转变为candidata并发动投票
+			rf.setStatus(Candidate)
+			rf.resetCandidateTimer()
+			rf.Vote()
+		}
 	}
 	//rf.persist()
 }
@@ -575,6 +584,7 @@ func (rf *Raft) ReplicateLogLoop(peer int) {
 		if rf.isKilled {
 			break
 		}
+		rf.heartbeatTimers[peer].Reset(HeartbeatDuration)
 		_, isLeader := rf.GetState()
 		if isLeader {
 			success := rf.replicateLogTo(peer)
@@ -584,7 +594,6 @@ func (rf *Raft) ReplicateLogLoop(peer int) {
 				rf.persist()
 			}
 		}
-		rf.heartbeatTimers[peer].Reset(HeartbeatDuration)
 	}
 }
 
