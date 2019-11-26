@@ -85,6 +85,7 @@ type Raft struct {
 	matchIndex []int         //记录每个fallow日志最大索引，0递增
 	applyCh    chan ApplyMsg //状态机apply
 	isKilled   bool          //节点退出
+	lastLogs   AppendEntries
 }
 
 func (rf *Raft) lock(info string) {
@@ -352,6 +353,7 @@ func (rf *Raft) persist() {
 	encoder.Encode(rf.commitIndex)
 	encoder.Encode(rf.lastApplied)
 	encoder.Encode(rf.logs)
+	encoder.Encode(rf.lastLogs)
 	data := writer.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -366,10 +368,12 @@ func (rf *Raft) readPersist(data []byte) {
 	decoder := labgob.NewDecoder(reader)
 	var commitIndex, lastApplied, currentTerm int
 	var logs []LogEntry
+	var lastlogs AppendEntries
 	if decoder.Decode(&currentTerm) != nil ||
 		decoder.Decode(&commitIndex) != nil ||
 		decoder.Decode(&lastApplied) != nil ||
-		decoder.Decode(&logs) != nil {
+		decoder.Decode(&logs) != nil ||
+		decoder.Decode(&lastlogs) != nil {
 		log.Println("Error in unmarshal raft state")
 	} else {
 
@@ -377,6 +381,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.commitIndex = commitIndex
 		rf.lastApplied = lastApplied
 		rf.logs = logs
+		rf.lastLogs = lastlogs
 	}
 }
 
@@ -461,7 +466,6 @@ func (rf *Raft) Vote() {
 		rf.replicateLogNow()
 	}
 }
-
 
 //主轮询loop
 func (rf *Raft) ElectionLoop() {
@@ -633,6 +637,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.setStatus(Fallower)
 
+	rf.lastLogs = AppendEntries{
+		Me:   -1,
+		Term: -1,
+	}
 	//日志同步协程
 	for i := 0; i < len(rf.peers); i++ {
 		rf.heartbeatTimers[i] = time.NewTimer(HeartbeatDuration)
