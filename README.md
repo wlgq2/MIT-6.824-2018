@@ -3,6 +3,6 @@ https://pdos.csail.mit.edu/6.824/
 
 ## Status
 - [x] MapReduce
-- [ ] Raft
+- [x] Raft
 - [ ] Fault-tolerant K/V Service
 - [ ] Sharded K/V Service
