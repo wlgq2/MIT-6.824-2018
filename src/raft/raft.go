@@ -85,8 +85,8 @@ type Raft struct {
 	matchIndex []int         //记录每个fallow日志最大索引，0递增
 	applyCh    chan ApplyMsg //状态机apply
 	isKilled   bool          //节点退出
-	lastLogs   AppendEntries
-	EnableLog bool
+	lastLogs   AppendEntries //最后更新日志
+	EnableLog bool //写日志
 }
 
 func (rf *Raft) println(args ...interface{}) {
@@ -211,6 +211,7 @@ func (rf *Raft) getLogTermOfIndex(index int) int {
 	return rf.logs[index-1].Term
 }
 
+//获取该节点更新日志
 func (rf *Raft) getEntriesInfo(index int, entries *[]LogEntry) (preterm int, preindex int) {
 	pre := index - 1
 	if pre == 0 {
@@ -226,6 +227,7 @@ func (rf *Raft) getEntriesInfo(index int, entries *[]LogEntry) (preterm int, pre
 	return
 }
 
+//获取该节点更新日志及信息
 func (rf *Raft) getAppendEntries(peer int) AppendEntries {
 	rf.lock("Raft.getAppendEntries")
 	defer rf.unlock("Raft.getAppendEntries")
@@ -261,6 +263,7 @@ func (rf *Raft) setNextAndMatch(peer int, index int) {
 	rf.matchIndex[peer] = index
 }
 
+//更新日志
 func (rf *Raft) updateLog(index int, logEntrys []LogEntry) {
 	rf.lock("Raft.updateLog")
 	defer rf.unlock("Raft.updateLog")
@@ -428,7 +431,7 @@ func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.setStatus(Fallower)
 	rf.setTerm(req.ElectionTerm)
 	logterm, logindex := rf.getLogTermAndIndex()
-	//判定竞选者日志是否更新
+	//判定竞选者日志是否新于自己
 	if logterm > req.LogTerm {
 		rf.println(rf.me, "refuse", req.Me, "because of logs's term")
 		reply.IsAgree = false
@@ -595,7 +598,7 @@ func (rf *Raft) replicateLogTo(peer int) bool {
 				rf.println(rf.me, "become fallow ", peer, "term :", resp.Term)
 				rf.setTerm(resp.Term)
 				rf.setStatus(Fallower)
-			} else if !resp.Successed { //如果更新失败则fallow日志状态减1
+			} else if !resp.Successed { //如果更新失败则更新fallow 日志next索引
 				//rf.incNext(peer)
 				rf.setNext(peer,resp.LastApplied+1)
 				isLoop = true
@@ -612,6 +615,7 @@ func (rf *Raft) replicateLogTo(peer int) bool {
 	return replicateRst
 }
 
+//立即复制日志
 func (rf *Raft) replicateLogNow() {
 	rf.lock("Raft.replicateLogNow")
 	defer rf.unlock("Raft.replicateLogNow")
@@ -619,7 +623,7 @@ func (rf *Raft) replicateLogNow() {
 		rf.heartbeatTimers[i].Reset(0)
 	}
 }
-
+//日志循环loop
 func (rf *Raft) ReplicateLogLoop(peer int) {
 	defer func() {
 		rf.heartbeatTimers[peer].Stop()
