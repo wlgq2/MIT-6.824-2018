@@ -17,13 +17,14 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 }
 
+var kvOnce sync.Once
+var KVServerEnableLog bool
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -32,16 +33,50 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
+	kvs       map[string]string
+	
 	// Your definitions here.
 }
 
+func (kv *KVServer) println(args ...interface{}) {
+	if KVServerEnableLog {
+		log.Println(args...)
+	}
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	reply.WrongLeader = false
+	value, ok := kv.kvs[args.Key]
+	if ok {
+		reply.Value = value
+		reply.Err = ""
+	} else {
+		reply.Value = ""
+		reply.Err = "Not find this key."
+	}
+	log.Printf("%p",kv)
+	kv.println("on get",args.Key,reply.Value)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.println("on",args.Op,args.Key,args.Value)
+	reply.WrongLeader = false
+	reply.Err = ""
+	if args.Op == "Put" {
+		kv.kvs[args.Key] = args.Value
+	} else if args.Op == "Append" {
+		value, ok := kv.kvs[args.Key]
+		if !ok {
+			value = ""
+		}
+		value += args.Value
+		kv.kvs[args.Key] = value
+	}
 }
 
 //
@@ -78,12 +113,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
-	// You may need initialization code here.
-
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
-	// You may need initialization code here.
-
+	kv.kvs = make(map[string]string)
+	KVServerEnableLog = true;
+	kvOnce.Do(func() {
+		log.SetFlags(log.Ltime | log.Lmicroseconds | log.Lshortfile)
+	})
 	return kv
 }
