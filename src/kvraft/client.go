@@ -3,10 +3,10 @@ package raftkv
 import "labrpc"
 import "crypto/rand"
 import "math/big"
-
+import "time"
 
 type Clerk struct {
-	servers []*labrpc.ClientEnd
+	servers  []*labrpc.ClientEnd
 	leaderId int
 	// You will have to modify this struct.
 }
@@ -39,31 +39,28 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 func (ck *Clerk) Get(key string) string {
 	req := GetArgs{
-		Key:key,
+		Key: key,
 	}
-	resp := GetReply {}
-	ck.servers[ck.leaderId].Call("KVServer.Get",&req,&resp)
+	resp := GetReply{}
+	ck.servers[ck.leaderId].Call("KVServer.Get", &req, &resp)
 	return resp.Value
 }
 
-//
-// shared by Put and Append.
-//
-// you can send an RPC with code like this:
-// ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	req := PutAppendArgs{
-		Key:key,
-		Value:value,
-		Op:op,	
+		Key:   key,
+		Value: value,
+		Op:    op,
 	}
-	resp := PutAppendReply {}
-	ck.servers[ck.leaderId].Call("KVServer.PutAppend",&req,&resp)
+	for {
+		resp := PutAppendReply{}
+		ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", &req, &resp)
+		if ok && !resp.WrongLeader && resp.Err == "" {
+			break
+		}
+		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+		time.Sleep(time.Millisecond * 200)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

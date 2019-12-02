@@ -6,25 +6,17 @@ import (
 	"log"
 	"raft"
 	"sync"
+	"time"
 )
 
-const Debug = 0
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
-}
-
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+type RaftCommand struct {
+	ch  chan (bool)
+	req PutAppendArgs
 }
 
 var kvOnce sync.Once
 var KVServerEnableLog bool
+
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -33,8 +25,8 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	kvs       map[string]string
-	
+	kvs      map[string]string
+	killChan chan (bool)
 	// Your definitions here.
 }
 
@@ -47,7 +39,6 @@ func (kv *KVServer) println(args ...interface{}) {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-
 	reply.WrongLeader = false
 	value, ok := kv.kvs[args.Key]
 	if ok {
@@ -57,37 +48,66 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Value = ""
 		reply.Err = "Not find this key."
 	}
-	log.Printf("%p",kv)
-	kv.println("on get",args.Key,reply.Value)
 }
 
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+func (kv *KVServer) PutAppend(req *PutAppendArgs, reply *PutAppendReply) {
+	command := RaftCommand{
+		ch:  make(chan (bool)),
+		req: *req,
+	}
+	_, _, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.WrongLeader = true
+		reply.Err = "error leader."
+	}
+	reply.WrongLeader = false
+	select {
+	case <-command.ch:
+		reply.Err = ""
+	case <-time.After(time.Millisecond * 1000):
+		reply.Err = "timeout"
+	}
+
+}
+
+func (kv *KVServer) putAppend(req *PutAppendArgs) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	kv.println("on",args.Op,args.Key,args.Value)
-	reply.WrongLeader = false
-	reply.Err = ""
-	if args.Op == "Put" {
-		kv.kvs[args.Key] = args.Value
-	} else if args.Op == "Append" {
-		value, ok := kv.kvs[args.Key]
+	if req.Op == "Put" {
+		kv.kvs[req.Key] = req.Value
+	} else if req.Op == "Append" {
+		value, ok := kv.kvs[req.Key]
 		if !ok {
 			value = ""
 		}
-		value += args.Value
-		kv.kvs[args.Key] = value
+		value += req.Value
+		kv.kvs[req.Key] = value
 	}
 }
 
-//
-// the tester calls Kill() when a KVServer instance won't
-// be needed again. you are not required to do anything
-// in Kill(), but it might be convenient to (for example)
-// turn off debug output from this instance.
-//
 func (kv *KVServer) Kill() {
 	kv.rf.Kill()
-	// Your code here, if desired.
+	kv.killChan <- true
+}
+
+func (kv *KVServer) onApply(applyMsg raft.ApplyMsg) {
+	command := applyMsg.Command.(RaftCommand)
+	kv.putAppend(&command.req)
+	select {
+	case command.ch <- true:
+	default:
+	}
+}
+
+func (kv *KVServer) mainLoop() {
+	for {
+		select {
+		case <-kv.killChan:
+			return
+		case msg := <-kv.applyCh:
+			kv.onApply(msg)
+		}
+	}
 }
 
 //
@@ -107,18 +127,22 @@ func (kv *KVServer) Kill() {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
 
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	go kv.mainLoop()
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.rf.EnableDebugLog = true
 	kv.kvs = make(map[string]string)
-	KVServerEnableLog = true;
+	kv.killChan = make(chan (bool))
+	KVServerEnableLog = true
+
 	kvOnce.Do(func() {
 		log.SetFlags(log.Ltime | log.Lmicroseconds | log.Lshortfile)
+		labgob.Register(RaftCommand{})
 	})
 	return kv
 }
