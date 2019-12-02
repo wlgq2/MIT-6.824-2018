@@ -7,8 +7,6 @@ import "math/rand"
 import "log"
 import "bytes"
 import "labgob"
-import "runtime"
-import "strconv"
 import "sort"
 
 //import "os"
@@ -16,13 +14,14 @@ import "sort"
 const Fallower, Leader, Candidate int = 1, 2, 3
 
 //心跳周期
-const HeartbeatDuration = time.Duration(time.Millisecond * 1000)
+const HeartbeatDuration = time.Duration(time.Millisecond * 600)
 
 //竞选周期
 const CandidateDuration = HeartbeatDuration * 2
 
 var raftOnce sync.Once
 
+//状态机apply
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -76,7 +75,7 @@ type Raft struct {
 	commitIndex     int                 //当前日志提交处
 	lastApplied     int                 //当前状态机执行处
 	status          int                 //节点状态
-	currentTerm     int                 //当前周期
+	currentTerm     int                 //当前任期
 	heartbeatTimers []*time.Timer       //心跳定时器
 	eletionTimer    *time.Timer         //竞选超时定时器
 	randtime        *rand.Rand          //随机数，用于随机竞选周期，避免节点间竞争。
@@ -86,11 +85,11 @@ type Raft struct {
 	applyCh    chan ApplyMsg //状态机apply
 	isKilled   bool          //节点退出
 	lastLogs   AppendEntries //最后更新日志
-	EnableLog bool //写日志
+	EnableDebugLog bool //打印调试日志开关
 }
-
+//打印调试日志
 func (rf *Raft) println(args ...interface{}) {
-	if rf.EnableLog {
+	if rf.EnableDebugLog {
 		log.Println(args ...)
 	}
 }
@@ -104,7 +103,7 @@ func (rf *Raft) unlock(info string) {
 	//rf.println(GetGID(), rf.me, "try unlock", info)
 	rf.mu.Unlock()
 }
-
+//投票RPC
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	rstChan := make(chan (bool))
 	ok := false
@@ -119,7 +118,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	}
 	return ok
 }
-
+//同步日志RPC
 func (rf *Raft) sendAppendEnteries(server int, req *AppendEntries, resp *RespEntries) bool {
 	rstChan := make(chan (bool))
 	ok := false
@@ -133,30 +132,30 @@ func (rf *Raft) sendAppendEnteries(server int, req *AppendEntries, resp *RespEnt
 	}
 	return ok
 }
-
+//获取状态和任期
 func (rf *Raft) GetState() (int, bool) {
 	rf.lock("Raft.GetState")
 	defer rf.unlock("Raft.GetState")
 	isleader := rf.status == Leader
 	return rf.currentTerm, isleader
 }
-
+//设置任期
 func (rf *Raft) setTerm(term int) {
 	rf.lock("Raft.setTerm")
 	defer rf.unlock("Raft.setTerm")
 	rf.currentTerm = term
 }
-
+//增加任期
 func (rf *Raft) addTerm(term int) {
 	rf.lock("Raft.addTerm")
 	defer rf.unlock("Raft.addTerm")
 	rf.currentTerm += term
 }
-
+//设置当前节点状态
 func (rf *Raft) setStatus(status int) {
 	rf.lock("Raft.setStatus")
 	defer rf.unlock("Raft.setStatus")
-	//设置节点状态，变换为fallow时候重置选举定时器
+	//设置节点状态，变换为fallow时候重置选举定时器（避免竞争）
 	if (rf.status != Fallower) && (status == Fallower) {
 		rf.resetCandidateTimer()
 	}
@@ -171,19 +170,19 @@ func (rf *Raft) setStatus(status int) {
 	}
 	rf.status = status
 }
-
+//获取状态
 func (rf *Raft) getStatus() int {
 	rf.lock("Raft.getStatus")
 	defer rf.unlock("Raft.getStatus")
 	return rf.status
 }
-
+//获取提交日志索引
 func (rf *Raft) getCommitIndex() int {
 	rf.lock("Raft.getCommitedCnt")
 	defer rf.unlock("Raft.getCommitedCnt")
 	return rf.commitIndex
 }
-
+//设置提交日志索引
 func (rf *Raft) setCommitIndex(index int) {
 	rf.lock("Raft.setCommitIndex")
 	defer rf.unlock("Raft.setCommitIndex")
@@ -241,7 +240,7 @@ func (rf *Raft) getAppendEntries(peer int) AppendEntries {
 	rst.PrevLogTerm, rst.PrevLogIndex = rf.getEntriesInfo(next, &rst.Entries)
 	return rst
 }
-
+//减少fallow next日志索引
 func (rf *Raft) incNext(peer int) {
 	rf.lock("Raft.incNext")
 	defer rf.unlock("Raft.incNext")
@@ -249,13 +248,13 @@ func (rf *Raft) incNext(peer int) {
 		rf.nextIndex[peer]--
 	}
 }
-
+//设置fallow next日志索引
 func (rf *Raft) setNext(peer int,next int) {
 	rf.lock("Raft.setNext")
 	defer rf.unlock("Raft.setNext")
 	rf.nextIndex[peer] = next
 }
-
+//设置fallower next和match日志索引
 func (rf *Raft) setNextAndMatch(peer int, index int) {
 	rf.lock("Raft.setNextAndMatch")
 	defer rf.unlock("Raft.setNextAndMatch")
@@ -263,7 +262,7 @@ func (rf *Raft) setNextAndMatch(peer int, index int) {
 	rf.matchIndex[peer] = index
 }
 
-//更新日志
+//更新插入同步日志
 func (rf *Raft) updateLog(index int, logEntrys []LogEntry) {
 	rf.lock("Raft.updateLog")
 	defer rf.unlock("Raft.updateLog")
@@ -277,7 +276,7 @@ func (rf *Raft) updateLog(index int, logEntrys []LogEntry) {
 	//重置log大小
 	rf.logs = rf.logs[:index+len(logEntrys)]
 }
-
+//插入日志
 func (rf *Raft) insertLog(command interface{}) int {
 	rf.lock("Raft.insertLog")
 	defer rf.unlock("Raft.insertLog")
@@ -342,13 +341,13 @@ func (rf *Raft) apply() {
 		rf.println(rf.me, "apply log", rf.lastApplied-1, rf.logs[rf.lastApplied-1].Term, "-", rf.logs[rf.lastApplied-1].Index)
 	}
 }
-
+//设置最后一次提交（用于乱序判定）
 func (rf *Raft) setLastLog(req *AppendEntries) {
 	rf.lock("Raft.setLastLog")
 	defer rf.unlock("Raft.setLastLog")
 	rf.lastLogs = *req
 }
-
+//判定乱序
 func (rf *Raft) isOldRequest(req *AppendEntries) bool {
 	rf.lock("Raft.isOldRequest")
 	defer rf.unlock("Raft.isOldRequest")
@@ -362,19 +361,9 @@ func (rf *Raft) isOldRequest(req *AppendEntries) bool {
 
 //重置竞选周期定时
 func (rf *Raft) resetCandidateTimer() {
-	randCnt := rf.randtime.Intn(600)
+	randCnt := rf.randtime.Intn(250)
 	duration := time.Duration(randCnt)*time.Millisecond + CandidateDuration
 	rf.eletionTimer.Reset(duration)
-}
-
-//获取协程ID
-func GetGID() uint64 {
-	b := make([]byte, 64)
-	b = b[:runtime.Stack(b, false)]
-	b = bytes.TrimPrefix(b, []byte("goroutine "))
-	b = b[:bytes.IndexByte(b, ' ')]
-	n, _ := strconv.ParseUint(string(b), 10, 64)
-	return n
 }
 
 func (rf *Raft) persist() {
@@ -417,7 +406,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.lastLogs = lastlogs
 	}
 }
-
+//收到投票请求
 func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.IsAgree = true
 	reply.CurrentTerm, _ = rf.GetState()
@@ -489,7 +478,7 @@ func (rf *Raft) Vote() {
 		}(i)
 	}
 	wait.Wait()
-	//如果存在系统任期更大，则更像任期并转为fallow
+	//如果存在系统任期更大，则更新任期并转为fallow
 	if term > currentTerm {
 		rf.setTerm(term)
 		rf.setStatus(Fallower)
@@ -500,7 +489,7 @@ func (rf *Raft) Vote() {
 	}
 }
 
-//主轮询loop
+//选举定时器loop
 func (rf *Raft) ElectionLoop() {
 	//选举超时定时器
 	rf.resetCandidateTimer()
@@ -522,7 +511,6 @@ func (rf *Raft) ElectionLoop() {
 			rf.Vote()
 		}
 	}
-	//rf.persist()
 }
 
 
@@ -540,7 +528,7 @@ func (rf *Raft) RequestAppendEntries(req *AppendEntries, resp *RespEntries) {
 	if rf.isOldRequest(req) {
 		return 
 	}
-	//否则更新自身任期，切换自生为fallow，充值选举定时器
+	//否则更新自身任期，切换自生为fallow，重置选举定时器
 	rf.resetCandidateTimer()
 	rf.setTerm(req.Term)
 	rf.setStatus(Fallower)
@@ -575,7 +563,7 @@ func (rf *Raft) RequestAppendEntries(req *AppendEntries, resp *RespEntries) {
 
 	return
 }
-
+//复制日志给fallower
 func (rf *Raft) replicateLogTo(peer int) bool {
 	replicateRst := false
 	if peer == rf.me {
@@ -598,7 +586,7 @@ func (rf *Raft) replicateLogTo(peer int) bool {
 				rf.println(rf.me, "become fallow ", peer, "term :", resp.Term)
 				rf.setTerm(resp.Term)
 				rf.setStatus(Fallower)
-			} else if !resp.Successed { //如果更新失败则更新fallow 日志next索引
+			} else if !resp.Successed { //如果更新失败则更新fallow日志next索引
 				//rf.incNext(peer)
 				rf.setNext(peer,resp.LastApplied+1)
 				isLoop = true
@@ -623,7 +611,7 @@ func (rf *Raft) replicateLogNow() {
 		rf.heartbeatTimers[i].Reset(0)
 	}
 }
-//日志循环loop
+//心跳周期复制日志loop
 func (rf *Raft) ReplicateLogLoop(peer int) {
 	defer func() {
 		rf.heartbeatTimers[peer].Stop()
@@ -681,7 +669,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.setStatus(Fallower)
-	rf.EnableLog = false
+	rf.EnableDebugLog = false
 	rf.lastLogs = AppendEntries{
 		Me:   -1,
 		Term: -1,
