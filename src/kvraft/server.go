@@ -27,7 +27,7 @@ type KVServer struct {
 
 	kvs      map[string]string
 	killChan chan (bool)
-	// Your definitions here.
+
 }
 
 func (kv *KVServer) println(args ...interface{}) {
