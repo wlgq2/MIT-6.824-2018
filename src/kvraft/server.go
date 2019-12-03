@@ -15,12 +15,12 @@ type PutAppendCommand struct {
 }
 
 type GetCommand struct {
-	Ch  chan (bool)
-	Req PutAppendArgs
+	Ch  chan (GetReply)
+	Req GetArgs
 }
 
 var kvOnce sync.Once
-var KVServerEnableLog bool
+
 
 type KVServer struct {
 	mu      sync.Mutex
@@ -30,35 +30,40 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	kvs      map[string]string
-	killChan chan (bool)
+	kvs            map[string]string
+	msgIDs      map[int64] int64
+	killChan    chan (bool)
+	EnableDebugLog bool
 }
 
 func (kv *KVServer) println(args ...interface{}) {
-	if KVServerEnableLog {
+	if kv.EnableDebugLog {
 		log.Println(args...)
 	}
 }
 
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	reply.WrongLeader = false
-	value, ok := kv.kvs[args.Key]
-	if ok {
-		reply.Value = value
-		reply.Err = ""
-	} else {
-		reply.Value = ""
-		reply.Err = "Not find this key."
+func (kv *KVServer) Get(req *GetArgs, reply *GetReply) {
+	command := GetCommand{
+		Ch:  make(chan (GetReply)),
+		Req: *req,
 	}
-	kv.println("on get",args.Key,":",reply.Value)
+	_, _, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.WrongLeader = true
+		reply.Err = "error leader."
+	}
+	reply.WrongLeader = false
+	select {
+	case *reply = <-command.Ch:
+	case <-time.After(time.Millisecond * 700):
+		reply.Err = "timeout"
+	}
 }
 
 func (kv *KVServer) PutAppend(req *PutAppendArgs, reply *PutAppendReply) {
 	command := PutAppendCommand{
 		Ch:  make(chan (bool)),
-		Req: *req,
+		Req: *req ,
 	}
 	_, _, isLeader := kv.rf.Start(command)
 	if !isLeader {
@@ -69,7 +74,7 @@ func (kv *KVServer) PutAppend(req *PutAppendArgs, reply *PutAppendReply) {
 	select {
 	case <-command.Ch:
 		reply.Err = ""
-	case <-time.After(time.Millisecond * 2000):
+	case <-time.After(time.Millisecond * 700):
 		reply.Err = "timeout"
 	}
 
@@ -91,17 +96,57 @@ func (kv *KVServer) putAppend(req *PutAppendArgs) {
 	}
 }
 
+func (kv *KVServer) get(args *GetArgs) (reply GetReply) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	reply.WrongLeader = false
+	value, ok := kv.kvs[args.Key]
+	if ok {
+		reply.Value = value
+		reply.Err = ""
+	} else {
+		reply.Value = ""
+		reply.Err = ""
+	}
+	kv.println("on get",args.Key,":",reply.Value)
+	return 
+}
+
 func (kv *KVServer) Kill() {
 	kv.rf.Kill()
 	kv.killChan <- true
 }
 
+func (kv *KVServer) isRepeated(req *PutAppendArgs) bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	index,ok := kv.msgIDs[req.Me]
+	if ok {
+		if index < req.MsgId {
+			kv.msgIDs[req.Me] = req.MsgId
+			return false
+		}
+		return true
+	}
+	kv.msgIDs[req.Me] = req.MsgId
+	return false
+}
+
 func (kv *KVServer) onApply(applyMsg raft.ApplyMsg) {
-	command := applyMsg.Command.(PutAppendCommand)
-	kv.putAppend(&command.Req)
-	select {
-	case command.Ch <- true:
-	default:
+	if command, ok := applyMsg.Command.(PutAppendCommand); ok {
+		if !kv.isRepeated(&command.Req) {
+			kv.putAppend(&command.Req)
+		}
+		select {
+		case command.Ch <- true:
+		default:
+		}
+	} else {
+		command := applyMsg.Command.(GetCommand)
+		select {
+		case command.Ch <- kv.get(&command.Req):
+		default:
+		}	
 	}
 }
 
@@ -131,23 +176,21 @@ func (kv *KVServer) mainLoop() {
 // for any long-running work.
 //
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
-
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-	go kv.mainLoop()
-
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	//kv.rf.EnableDebugLog = true
 	kv.kvs = make(map[string]string)
+	kv.msgIDs = make(map[int64]int64)
 	kv.killChan = make(chan (bool))
-	KVServerEnableLog = false
-
+	kv.EnableDebugLog = false
 	kvOnce.Do(func() {
 		labgob.Register(PutAppendCommand{})
 		labgob.Register(GetCommand{})
 		log.SetFlags(log.Ltime | log.Lmicroseconds | log.Lshortfile)
 	})
+	go kv.mainLoop()
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.rf.EnableDebugLog = false
 	return kv
 }

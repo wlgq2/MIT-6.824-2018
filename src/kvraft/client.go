@@ -4,11 +4,13 @@ import "labrpc"
 import "crypto/rand"
 import "math/big"
 import "time"
+import "sync/atomic"
 
 type Clerk struct {
 	servers  []*labrpc.ClientEnd
 	leaderId int
-	// You will have to modify this struct.
+	me       int64 
+	msgId    int64
 }
 
 func nrand() int64 {
@@ -22,21 +24,11 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	ck.leaderId = 0
+	ck.me = nrand()
+	ck.msgId = 0
 	return ck
 }
 
-//
-// fetch the current value for a key.
-// returns "" if the key does not exist.
-// keeps trying forever in the face of all other errors.
-//
-// you can send an RPC with code like this:
-// ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) Get(key string) string {
 	req := GetArgs{
 		Key: key,
@@ -48,7 +40,7 @@ func (ck *Clerk) Get(key string) string {
 			return resp.Value
 		}
 		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
-		time.Sleep(time.Millisecond * 200)	
+		time.Sleep(time.Millisecond * 5)	
 	}
 }
 
@@ -57,6 +49,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Key:   key,
 		Value: value,
 		Op:    op,
+		Me:  ck.me,
+		MsgId : atomic.AddInt64(&ck.msgId, 1) ,
 	}
 	for {
 		resp := PutAppendReply{}
@@ -65,7 +59,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			break
 		}
 		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
-		time.Sleep(time.Millisecond * 200)
+		time.Sleep(time.Millisecond * 5)
 	}
 }
 

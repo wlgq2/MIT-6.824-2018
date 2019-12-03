@@ -416,7 +416,7 @@ func (rf *Raft) readPersist(data []byte) {
 
 		rf.currentTerm = currentTerm
 		rf.commitIndex = commitIndex
-		rf.lastApplied = lastApplied
+		rf.lastApplied = 0//lastApplied
 		rf.logs = logs
 		rf.lastLogs = lastlogs
 	}
@@ -527,6 +527,7 @@ func (rf *Raft) ElectionLoop() {
 			rf.Vote()
 		}
 	}
+	rf.println(rf.me,"Exit ElectionLoop")
 }
 
 func (rf *Raft) RequestAppendEntries(req *AppendEntries, resp *RespEntries) {
@@ -648,6 +649,7 @@ func (rf *Raft) ReplicateLogLoop(peer int) {
 			}
 		}
 	}
+	rf.println(rf.me,"-",peer,"Exit ReplicateLogLoop")
 }
 
 func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
