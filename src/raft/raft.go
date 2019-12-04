@@ -34,6 +34,10 @@ type LogEntry struct {
 	Log   interface{}
 }
 
+type LogSnapshot struct {
+	Index int
+	Datas []byte
+} 
 //投票请求
 type RequestVoteArgs struct {
 	Me           int
@@ -56,6 +60,7 @@ type AppendEntries struct {
 	PrevLogIndex int
 	Entries      []LogEntry
 	LeaderCommit int
+	Snapshot     LogSnapshot //快照
 }
 
 //回复日志更新请求
@@ -71,6 +76,7 @@ type Raft struct {
 	persister       *Persister          // Object to hold this peer's persisted state
 	me              int                 // 自己服务编号
 	logs            []LogEntry          // 日志存储
+	logSnapshot     LogSnapshot         //日志快照
 	commitIndex     int                 //当前日志提交处
 	lastApplied     int                 //当前状态机执行处
 	status          int                 //节点状态
@@ -219,17 +225,28 @@ func (rf *Raft) getLogTermOfIndex(index int) int {
 	return rf.logs[index-1].Term
 }
 
+//获取快照
+func (rf *Raft) getSnapshot(index int, snapshot *LogSnapshot) int {
+	if index < rf.logSnapshot.Index { //如果fallow日志小于快照，则获取快照
+		*snapshot = rf.logSnapshot
+		index = 0 //更新快照时，从0开始复制日志
+	} else {
+		index -= rf.logSnapshot.Index
+	}
+	return index
+}
+
 //获取该节点更新日志
-func (rf *Raft) getEntriesInfo(index int, entries *[]LogEntry) (preterm int, preindex int) {
-	pre := index - 1
-	if pre == 0 {
+func (rf *Raft) getEntriesInfo(index int, snapshot *LogSnapshot,entries *[]LogEntry) (preterm int, preindex int) {
+	start := rf.getSnapshot( index - 1, snapshot)
+	if start == 0 {
 		preindex = 0
 		preterm = 0
 	} else {
-		preindex = rf.logs[pre-1].Index
-		preterm = rf.logs[pre-1].Term
+		preindex = rf.logs[start-1].Index
+		preterm = rf.logs[start-1].Term
 	}
-	for i := pre; i < len(rf.logs); i++ {
+	for i := start; i < len(rf.logs); i++ {
 		*entries = append(*entries, rf.logs[i])
 	}
 	return
@@ -242,11 +259,12 @@ func (rf *Raft) getAppendEntries(peer int) AppendEntries {
 	rst := AppendEntries{
 		Me:           rf.me,
 		Term:         rf.currentTerm,
-		LeaderCommit: rf.commitIndex,
+		LeaderCommit: rf.commitIndex ,
+		Snapshot : LogSnapshot{Index:0},
 	}
 	//当前fallow的日志状态
 	next := rf.nextIndex[peer]
-	rst.PrevLogTerm, rst.PrevLogIndex = rf.getEntriesInfo(next, &rst.Entries)
+	rst.PrevLogTerm, rst.PrevLogIndex = rf.getEntriesInfo(next, &rst.Snapshot, &rst.Entries)
 	return rst
 }
 
@@ -275,9 +293,13 @@ func (rf *Raft) setNextAndMatch(peer int, index int) {
 }
 
 //更新插入同步日志
-func (rf *Raft) updateLog(index int, logEntrys []LogEntry) {
+func (rf *Raft) updateLog(start int, logEntrys []LogEntry,snapshot *LogSnapshot) {
 	rf.lock("Raft.updateLog")
 	defer rf.unlock("Raft.updateLog")
+	if snapshot.Index > 0 {   //更新快照
+		rf.logSnapshot = *snapshot
+	}
+	index := start - rf.logSnapshot.Index
 	for i := 0; i < len(logEntrys); i++ {
 		if index+i < len(rf.logs) {
 			rf.logs[index+i] = logEntrys[i]
@@ -367,8 +389,8 @@ func (rf *Raft) isOldRequest(req *AppendEntries) bool {
 	rf.lock("Raft.isOldRequest")
 	defer rf.unlock("Raft.isOldRequest")
 	if req.Term == rf.lastLogs.Term && req.Me == rf.lastLogs.Me {
-		lastIndex := rf.lastLogs.PrevLogIndex + len(rf.lastLogs.Entries)
-		reqLastIndex := req.PrevLogIndex + len(req.Entries)
+		lastIndex := rf.lastLogs.PrevLogIndex + rf.lastLogs.Snapshot.Index+len(rf.lastLogs.Entries)
+		reqLastIndex := req.PrevLogIndex + req.Snapshot.Index+ len(req.Entries)
 		return lastIndex > reqLastIndex
 	}
 	return false
@@ -391,8 +413,10 @@ func (rf *Raft) persist() {
 	encoder.Encode(rf.lastApplied)
 	encoder.Encode(rf.logs)
 	encoder.Encode(rf.lastLogs)
+	encoder.Encode(rf.logSnapshot.Index)
 	data := writer.Bytes()
-	rf.persister.SaveRaftState(data)
+	//rf.persister.SaveRaftState(data)
+	rf.persister.SaveStateAndSnapshot(data,rf.logSnapshot.Datas)
 }
 
 func (rf *Raft) readPersist(data []byte) {
@@ -410,7 +434,8 @@ func (rf *Raft) readPersist(data []byte) {
 		decoder.Decode(&commitIndex) != nil ||
 		decoder.Decode(&lastApplied) != nil ||
 		decoder.Decode(&logs) != nil ||
-		decoder.Decode(&lastlogs) != nil {
+		decoder.Decode(&lastlogs) != nil  ||
+		decoder.Decode(&rf.logSnapshot.Index) != nil {
 		rf.println("Error in unmarshal raft state")
 	} else {
 
@@ -420,6 +445,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.logs = logs
 		rf.lastLogs = lastlogs
 	}
+	rf.logSnapshot.Datas = rf.persister.ReadSnapshot()
 }
 
 //收到投票请求
@@ -568,9 +594,9 @@ func (rf *Raft) RequestAppendEntries(req *AppendEntries, resp *RespEntries) {
 	//更新日志
 	rf.setLastLog(req)
 	size := len(req.Entries)
-	if size > 0 {
+	if size > 0 || req.Snapshot.Index > 0 {
 		rf.println(rf.me, "update log from ", req.Me, ":", req.Entries[0].Term, "-", req.Entries[0].Index, "to", req.Entries[len(req.Entries)-1].Term, "-", req.Entries[len(req.Entries)-1].Index)
-		rf.updateLog(req.PrevLogIndex, req.Entries)
+		rf.updateLog(req.PrevLogIndex, req.Entries,&req.Snapshot)
 	}
 	rf.setCommitIndex(req.LeaderCommit)
 	rf.apply()
@@ -670,6 +696,24 @@ func (rf *Raft) Kill() {
 	rf.replicateLogNow()
 }
 
+
+//保存快照
+func (rf *Raft) SaveSnapshot(index int,snapshot []byte) {
+	rf.lock("Raft.SaveSnapshot")
+	defer rf.unlock("Raft.SaveSnapshot")
+	
+	if index > rf.logSnapshot.Index {
+		//保存快照
+		start := rf.logSnapshot.Index
+		rf.logSnapshot.Index = index
+		rf.logSnapshot.Datas = snapshot
+		//删除快照日志
+		if len(rf.logs) >0 {
+			rf.logs = rf.logs[(index-start):]
+		}
+	}
+}
+
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
@@ -691,6 +735,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastLogs = AppendEntries{
 		Me:   -1,
 		Term: -1,
+	}
+	rf.logSnapshot = LogSnapshot{
+		Index : 0,
 	}
 	//日志同步协程
 	for i := 0; i < len(rf.peers); i++ {
