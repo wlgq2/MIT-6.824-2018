@@ -8,6 +8,8 @@ import "log"
 import "bytes"
 import "labgob"
 import "sort"
+
+
 //import "os"
 //节点状态
 const Fallower, Leader, Candidate int = 1, 2, 3
@@ -35,6 +37,7 @@ type LogEntry struct {
 }
 
 type LogSnapshot struct {
+	Term  int
 	Index int
 	Datas []byte
 } 
@@ -91,6 +94,7 @@ type Raft struct {
 	isKilled       bool          //节点退出
 	lastLogs       AppendEntries //最后更新日志
 	EnableDebugLog bool          //打印调试日志开关
+	LastGetLock    string
 }
 
 //打印调试日志
@@ -101,13 +105,13 @@ func (rf *Raft) println(args ...interface{}) {
 }
 
 func (rf *Raft) lock(info string) {
-	//rf.println(GetGID(), rf.me, "try lock", info)
 	rf.mu.Lock()
+	rf.LastGetLock = info
 }
 
 func (rf *Raft) unlock(info string) {
-	//rf.println(GetGID(), rf.me, "try unlock", info)
 	rf.mu.Unlock()
+	rf.LastGetLock = ""
 }
 
 //投票RPC
@@ -214,6 +218,9 @@ func (rf *Raft) getLogTermAndIndex() (int, int) {
 	if size > 0 {
 		index = rf.logs[size-1].Index
 		term = rf.logs[size-1].Term
+	} else {
+		index = rf.logSnapshot.Index
+		term = rf.logSnapshot.Term
 	}
 	return term, index
 }
@@ -222,12 +229,16 @@ func (rf *Raft) getLogTermAndIndex() (int, int) {
 func (rf *Raft) getLogTermOfIndex(index int) int {
 	rf.lock("Raft.getLogTermOfIndex")
 	defer rf.unlock("Raft.getLogTermOfIndex")
-	return rf.logs[index-1].Term
+	index -=(1+rf.logSnapshot.Index)
+	if index < 0 {
+		return rf.logSnapshot.Term
+	}
+	return rf.logs[index].Term
 }
 
 //获取快照
 func (rf *Raft) getSnapshot(index int, snapshot *LogSnapshot) int {
-	if index < rf.logSnapshot.Index { //如果fallow日志小于快照，则获取快照
+	if index <= rf.logSnapshot.Index { //如果fallow日志小于快照，则获取快照
 		*snapshot = rf.logSnapshot
 		index = 0 //更新快照时，从0开始复制日志
 	} else {
@@ -238,13 +249,24 @@ func (rf *Raft) getSnapshot(index int, snapshot *LogSnapshot) int {
 
 //获取该节点更新日志
 func (rf *Raft) getEntriesInfo(index int, snapshot *LogSnapshot,entries *[]LogEntry) (preterm int, preindex int) {
-	start := rf.getSnapshot( index - 1, snapshot)
-	if start == 0 {
+	start := rf.getSnapshot( index , snapshot)-1
+	if start < 0 {
 		preindex = 0
 		preterm = 0
+	} else if start == 0 {
+		if rf.logSnapshot.Index ==0 {
+			preindex = 0
+			preterm = 0
+		}  else {
+			preindex = rf.logSnapshot.Index
+			preterm = rf.logSnapshot.Term
+		}
 	} else {
 		preindex = rf.logs[start-1].Index
 		preterm = rf.logs[start-1].Term
+	}
+	if start < 0 {
+		start = 0
 	}
 	for i := start; i < len(rf.logs); i++ {
 		*entries = append(*entries, rf.logs[i])
@@ -298,6 +320,8 @@ func (rf *Raft) updateLog(start int, logEntrys []LogEntry,snapshot *LogSnapshot)
 	defer rf.unlock("Raft.updateLog")
 	if snapshot.Index > 0 {   //更新快照
 		rf.logSnapshot = *snapshot
+		start = rf.logSnapshot.Index
+		rf.println(rf.me,"update snapshot",rf.logSnapshot.Index)
 	}
 	index := start - rf.logSnapshot.Index
 	for i := 0; i < len(logEntrys); i++ {
@@ -323,6 +347,8 @@ func (rf *Raft) insertLog(command interface{}) int {
 	//获取log索引
 	if len(rf.logs) > 0 {
 		entry.Index = rf.logs[len(rf.logs)-1].Index + 1
+	} else {
+		entry.Index = rf.logSnapshot.Index+1
 	}
 	//插入log
 	rf.logs = append(rf.logs, entry)
@@ -363,17 +389,37 @@ func (rf *Raft) apply() {
 		last = rf.logs[len(rf.logs)-1].Index
 	}
 	lastapplied := rf.lastApplied
+	if rf.lastApplied< rf.logSnapshot.Index {
+		msg := ApplyMsg{
+			CommandValid: false,
+			Command:      rf.logSnapshot,
+			CommandIndex: 0,
+		}
+		rf.applyCh <- msg
+		rf.lastApplied = rf.logSnapshot.Index
+		rf.println(rf.me,"apply snapshot :", rf.logSnapshot.Index,"with logs:",len(rf.logs))
+	}
+
 	for ; rf.lastApplied < rf.commitIndex && rf.lastApplied < last; rf.lastApplied++ {
 		index := rf.lastApplied
 		msg := ApplyMsg{
 			CommandValid: true,
-			Command:      rf.logs[index].Log,
-			CommandIndex: rf.logs[index].Index,
+			Command:      rf.logs[index-rf.logSnapshot.Index].Log,
+			CommandIndex: rf.logs[index-rf.logSnapshot.Index].Index,
 		}
 		rf.applyCh <- msg
 	}
-	if rf.lastApplied > lastapplied {
-		rf.println(rf.me, "apply log", rf.lastApplied-1, rf.logs[rf.lastApplied-1].Term, "-", rf.logs[rf.lastApplied-1].Index)
+	if rf.lastApplied > lastapplied {	
+		appliedIndex := rf.lastApplied-1-rf.logSnapshot.Index
+		endIndex,endTerm :=0,0
+		if appliedIndex < 0 {
+			endIndex = rf.logSnapshot.Index
+			endTerm = rf.logSnapshot.Term
+		} else {
+			endTerm = rf.logs[rf.lastApplied-1-rf.logSnapshot.Index].Term
+			endIndex = rf.logs[rf.lastApplied-1-rf.logSnapshot.Index].Index
+		}
+		rf.println(rf.me, "apply log", rf.lastApplied-1,endTerm, "-", endIndex)
 	}
 }
 
@@ -405,34 +451,32 @@ func (rf *Raft) resetCandidateTimer() {
 
 func (rf *Raft) persist() {
 	rf.lock("Raft.persist")
-	defer rf.unlock("Raft.persist")
 	writer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(writer)
 	encoder.Encode(rf.currentTerm)
 	encoder.Encode(rf.commitIndex)
-	encoder.Encode(rf.lastApplied)
 	encoder.Encode(rf.logs)
 	encoder.Encode(rf.lastLogs)
 	encoder.Encode(rf.logSnapshot.Index)
 	data := writer.Bytes()
 	//rf.persister.SaveRaftState(data)
+	rf.unlock("Raft.persist")
 	rf.persister.SaveStateAndSnapshot(data,rf.logSnapshot.Datas)
 }
 
 func (rf *Raft) readPersist(data []byte) {
 	rf.lock("Raft.readPersist")
-	defer rf.unlock("Raft.readPersist")
 	if data == nil || len(data) < 1 {
+		rf.unlock("Raft.readPersist")
 		return
 	}
 	reader := bytes.NewBuffer(data)
 	decoder := labgob.NewDecoder(reader)
-	var commitIndex, lastApplied, currentTerm int
+	var commitIndex, currentTerm int
 	var logs []LogEntry
 	var lastlogs AppendEntries
 	if decoder.Decode(&currentTerm) != nil ||
 		decoder.Decode(&commitIndex) != nil ||
-		decoder.Decode(&lastApplied) != nil ||
 		decoder.Decode(&logs) != nil ||
 		decoder.Decode(&lastlogs) != nil  ||
 		decoder.Decode(&rf.logSnapshot.Index) != nil {
@@ -441,10 +485,11 @@ func (rf *Raft) readPersist(data []byte) {
 
 		rf.currentTerm = currentTerm
 		rf.commitIndex = commitIndex
-		rf.lastApplied = 0//lastApplied
+		rf.lastApplied = 0
 		rf.logs = logs
 		rf.lastLogs = lastlogs
 	}
+	rf.unlock("Raft.readPersist")
 	rf.logSnapshot.Datas = rf.persister.ReadSnapshot()
 }
 
@@ -593,9 +638,21 @@ func (rf *Raft) RequestAppendEntries(req *AppendEntries, resp *RespEntries) {
 	}
 	//更新日志
 	rf.setLastLog(req)
-	size := len(req.Entries)
-	if size > 0 || req.Snapshot.Index > 0 {
-		rf.println(rf.me, "update log from ", req.Me, ":", req.Entries[0].Term, "-", req.Entries[0].Index, "to", req.Entries[len(req.Entries)-1].Term, "-", req.Entries[len(req.Entries)-1].Index)
+	startTerm,startIndex,endTerm,endIndex  := -1,-1,-1,-1
+	if len(req.Entries) > 0 {
+		startTerm = req.Entries[0].Term
+		startIndex = req.Entries[0].Index
+		endTerm = req.Entries[len(req.Entries)-1].Term
+		endIndex = req.Entries[len(req.Entries)-1].Index
+	}
+	if req.Snapshot.Index > 0 {
+		startIndex = 1
+		if endIndex == -1 {
+			endIndex = req.Snapshot.Index
+		}
+	}
+	if  endIndex > 0 {
+		rf.println(rf.me, "update log from ", req.Me, ":", startTerm, "-", startIndex, "to", endTerm, "-", endIndex)
 		rf.updateLog(req.PrevLogIndex, req.Entries,&req.Snapshot)
 	}
 	rf.setCommitIndex(req.LeaderCommit)
@@ -664,7 +721,9 @@ func (rf *Raft) ReplicateLogLoop(peer int) {
 		if rf.isKilled {
 			break
 		}
+		rf.lock("Raft.ReplicateLogLoop")
 		rf.heartbeatTimers[peer].Reset(HeartbeatDuration)
+		rf.unlock("Raft.ReplicateLogLoop")
 		_, isLeader := rf.GetState()
 		if isLeader {
 			success := rf.replicateLogTo(peer)
@@ -700,18 +759,21 @@ func (rf *Raft) Kill() {
 //保存快照
 func (rf *Raft) SaveSnapshot(index int,snapshot []byte) {
 	rf.lock("Raft.SaveSnapshot")
-	defer rf.unlock("Raft.SaveSnapshot")
-	
 	if index > rf.logSnapshot.Index {
 		//保存快照
+		rf.println(rf.me,"save snapshot :",index,",len logs:",len(rf.logs))
 		start := rf.logSnapshot.Index
 		rf.logSnapshot.Index = index
 		rf.logSnapshot.Datas = snapshot
+		rf.logSnapshot.Term = rf.logs[index-start-1].Term
 		//删除快照日志
 		if len(rf.logs) >0 {
 			rf.logs = rf.logs[(index-start):]
 		}
+		rf.println(rf.me,"after save snapshot len logs:",len(rf.logs))
 	}
+	rf.unlock("Raft.SaveSnapshot")
+	rf.persist()
 }
 
 func Make(peers []*labrpc.ClientEnd, me int,
@@ -738,6 +800,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	rf.logSnapshot = LogSnapshot{
 		Index : 0,
+		Term :0 ,
 	}
 	//日志同步协程
 	for i := 0; i < len(rf.peers); i++ {
@@ -750,7 +813,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		//filename :=  "log"+time.Now().Format("2006-01-02 15_04_05") +".txt"
 		//file, _ := os.OpenFile(filename, os.O_RDWR | os.O_CREATE | os.O_APPEND, 0666)
 		//log.SetOutput(file)
-		log.SetFlags(log.Ltime | log.Lmicroseconds | log.Lshortfile)
+		log.SetFlags(log.Ltime | log.Lmicroseconds)
 	})
 	//Leader选举协程
 	go rf.ElectionLoop()

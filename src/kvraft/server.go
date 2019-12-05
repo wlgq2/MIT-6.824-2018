@@ -7,6 +7,7 @@ import (
 	"raft"
 	"sync"
 	"time"
+	"bytes"
 )
 
 type PutAppendCommand struct {
@@ -23,7 +24,7 @@ var kvOnce sync.Once
 
 
 type KVServer struct {
-	mu      sync.Mutex
+	//mu      sync.Mutex  //数据操作都在mainLoop协程，不需要锁
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
@@ -31,9 +32,9 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	kvs            map[string]string
-	msgIDs      map[int64] int64
-	killChan    chan (bool)
-	persister *raft.Persister
+	msgIDs         map[int64] int64
+	killChan       chan (bool)
+	persister      *raft.Persister
 	EnableDebugLog bool
 }
 
@@ -82,9 +83,7 @@ func (kv *KVServer) PutAppend(req *PutAppendArgs, reply *PutAppendReply) {
 }
 
 func (kv *KVServer) putAppend(req *PutAppendArgs) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	kv.println("on",req.Op,req.Key,":",req.Value)
+	kv.println(kv.me,"on",req.Op,req.Key,":",req.Value)
 	if req.Op == "Put" {
 		kv.kvs[req.Key] = req.Value
 	} else if req.Op == "Append" {
@@ -98,8 +97,6 @@ func (kv *KVServer) putAppend(req *PutAppendArgs) {
 }
 
 func (kv *KVServer) get(args *GetArgs) (reply GetReply) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
 	reply.WrongLeader = false
 	value, ok := kv.kvs[args.Key]
 	if ok {
@@ -109,7 +106,7 @@ func (kv *KVServer) get(args *GetArgs) (reply GetReply) {
 		reply.Value = ""
 		reply.Err = ""
 	}
-	kv.println("on get",args.Key,":",reply.Value)
+	kv.println(kv.me,"on get",args.Key,":",reply.Value)
 	return 
 }
 
@@ -119,8 +116,6 @@ func (kv *KVServer) Kill() {
 }
 
 func (kv *KVServer) isRepeated(req *PutAppendArgs) bool {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
 	index,ok := kv.msgIDs[req.Me]
 	if ok {
 		if index < req.MsgId {
@@ -133,21 +128,45 @@ func (kv *KVServer) isRepeated(req *PutAppendArgs) bool {
 	return false
 }
 
-func  (kv *KVServer) ifSaveSnapshot() {
+func  (kv *KVServer) ifSaveSnapshot(index int) {
 	if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
-
+		writer := new(bytes.Buffer)
+		encoder := labgob.NewEncoder(writer)
+		encoder.Encode(kv.msgIDs)
+		encoder.Encode(kv.kvs)
+		data := writer.Bytes()
+		kv.rf.SaveSnapshot(index,data)
+		return 
 	}
 }
 
-func  (kv *KVServer) readSnapshot() {
+func  (kv *KVServer) updateSnapshot(data [] byte) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+	reader := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(reader)
+
+	if decoder.Decode(&kv.msgIDs) != nil ||
+		decoder.Decode(&kv.kvs) != nil  {
+		kv.println("Error in unmarshal raft state")
+	} 
 }
 
+
+
 func (kv *KVServer) onApply(applyMsg raft.ApplyMsg) {
+	if !applyMsg.CommandValid {
+		if command, ok := applyMsg.Command.(raft.LogSnapshot); ok {
+			kv.updateSnapshot(command.Datas)
+		}
+		return
+	}
 	if command, ok := applyMsg.Command.(PutAppendCommand); ok {
 		if !kv.isRepeated(&command.Req) {
 			kv.putAppend(&command.Req)
+			kv.ifSaveSnapshot(applyMsg.CommandIndex)
 		}
-		kv.ifSaveSnapshot()
 		select {
 		case command.Ch <- true:
 		default:
@@ -176,7 +195,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 1024)
 	kv.kvs = make(map[string]string)
 	kv.msgIDs = make(map[int64]int64)
 	kv.killChan = make(chan (bool))
@@ -185,7 +204,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kvOnce.Do(func() {
 		labgob.Register(PutAppendCommand{})
 		labgob.Register(GetCommand{})
-		log.SetFlags(log.Ltime | log.Lmicroseconds | log.Lshortfile)
 	})
 	go kv.mainLoop()
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
