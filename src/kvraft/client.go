@@ -5,6 +5,7 @@ import "crypto/rand"
 import "math/big"
 import "time"
 import "sync/atomic"
+import "log"
 
 type Clerk struct {
 	servers  []*labrpc.ClientEnd
@@ -33,15 +34,18 @@ func (ck *Clerk) Get(key string) string {
 	req := GetArgs{
 		Key: key,
 	}
-	for {
+	for i:=0; i<8000; i++{
 		resp := GetReply{}
 		ok := ck.servers[ck.leaderId].Call("KVServer.Get", &req, &resp)
 		if ok && !resp.WrongLeader && resp.Err == "" {
+			time.Sleep(time.Millisecond * 100)
 			return resp.Value
 		}
 		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 		time.Sleep(time.Millisecond * 5)	
 	}
+	log.Fatalln("Get",key,"timeout")
+	return ""
 }
 
 func (ck *Clerk) PutAppend(key string, value string, op string) {
@@ -52,15 +56,17 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Me:  ck.me,
 		MsgId : atomic.AddInt64(&ck.msgId, 1) ,
 	}
-	for {
+	for i:=0; i<8000; i++ {
 		resp := PutAppendReply{}
 		ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", &req, &resp)
 		if ok && !resp.WrongLeader && resp.Err == "" {
-			break
+			time.Sleep(time.Millisecond * 100)
+			return
 		}
 		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 		time.Sleep(time.Millisecond * 5)
 	}
+	log.Fatalln(op,key,value,"timeout")
 }
 
 func (ck *Clerk) Put(key string, value string) {

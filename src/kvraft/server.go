@@ -16,7 +16,7 @@ type PutAppendCommand struct {
 }
 
 type GetCommand struct {
-	Ch  chan (GetReply)
+	Ch  chan (string)
 	Req GetArgs
 }
 
@@ -24,7 +24,7 @@ var kvOnce sync.Once
 
 
 type KVServer struct {
-	//mu      sync.Mutex  //数据操作都在mainLoop协程，不需要锁
+	mu      sync.Mutex 
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
@@ -35,6 +35,7 @@ type KVServer struct {
 	msgIDs         map[int64] int64
 	killChan       chan (bool)
 	persister      *raft.Persister
+	logApplyIndex  int
 	EnableDebugLog bool
 }
 
@@ -46,18 +47,21 @@ func (kv *KVServer) println(args ...interface{}) {
 
 func (kv *KVServer) Get(req *GetArgs, reply *GetReply) {
 	command := GetCommand{
-		Ch:  make(chan (GetReply)),
+		Ch:  make(chan (string)),
 		Req: *req,
 	}
+	//写入Raft日志，等待数据返回
 	_, _, isLeader := kv.rf.Start(command)
 	if !isLeader {
 		reply.WrongLeader = true
 		reply.Err = "error leader."
+		return
 	}
 	reply.WrongLeader = false
 	select {
-	case *reply = <-command.Ch:
-	case <-time.After(time.Millisecond * 700):
+	case reply.Value = <-command.Ch:
+		reply.Err = ""
+	case <-time.After(time.Millisecond * 1000): //超时
 		reply.Err = "timeout"
 	}
 }
@@ -67,16 +71,24 @@ func (kv *KVServer) PutAppend(req *PutAppendArgs, reply *PutAppendReply) {
 		Ch:  make(chan (bool)),
 		Req: *req ,
 	}
+	//去重复
+	if kv.isRepeated(req) {
+		reply.WrongLeader = false
+		reply.Err = ""
+		return
+	}
+	//写入Raft日志，等待数据返回
 	_, _, isLeader := kv.rf.Start(command)
 	if !isLeader {
 		reply.WrongLeader = true
 		reply.Err = "error leader."
+		return 
 	}
 	reply.WrongLeader = false
 	select {
 	case <-command.Ch:
 		reply.Err = ""
-	case <-time.After(time.Millisecond * 700):
+	case <-time.After(time.Millisecond * 700): //超时
 		reply.Err = "timeout"
 	}
 
@@ -96,17 +108,12 @@ func (kv *KVServer) putAppend(req *PutAppendArgs) {
 	}
 }
 
-func (kv *KVServer) get(args *GetArgs) (reply GetReply) {
-	reply.WrongLeader = false
+func (kv *KVServer) get(args *GetArgs) (value string) {
 	value, ok := kv.kvs[args.Key]
-	if ok {
-		reply.Value = value
-		reply.Err = ""
-	} else {
-		reply.Value = ""
-		reply.Err = ""
+	if !ok {
+		value = ""
 	}
-	kv.println(kv.me,"on get",args.Key,":",reply.Value)
+	kv.println(kv.me,"on get",args.Key,":",value)
 	return 
 }
 
@@ -116,6 +123,18 @@ func (kv *KVServer) Kill() {
 }
 
 func (kv *KVServer) isRepeated(req *PutAppendArgs) bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	index,ok := kv.msgIDs[req.Me]
+	if ok {
+		return index >= req.MsgId
+	}
+	return false
+}
+
+func (kv *KVServer) isRepeatedWithUpdate(req *PutAppendArgs) bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	index,ok := kv.msgIDs[req.Me]
 	if ok {
 		if index < req.MsgId {
@@ -128,14 +147,14 @@ func (kv *KVServer) isRepeated(req *PutAppendArgs) bool {
 	return false
 }
 
-func  (kv *KVServer) ifSaveSnapshot(index int) {
+func  (kv *KVServer) ifSaveSnapshot() {
 	if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
 		writer := new(bytes.Buffer)
 		encoder := labgob.NewEncoder(writer)
 		encoder.Encode(kv.msgIDs)
 		encoder.Encode(kv.kvs)
 		data := writer.Bytes()
-		kv.rf.SaveSnapshot(index,data)
+		kv.rf.SaveSnapshot(kv.logApplyIndex,data)
 		return 
 	}
 }
@@ -156,36 +175,43 @@ func  (kv *KVServer) updateSnapshot(data [] byte) {
 
 
 func (kv *KVServer) onApply(applyMsg raft.ApplyMsg) {
-	if !applyMsg.CommandValid {
-		if command, ok := applyMsg.Command.(raft.LogSnapshot); ok {
+	if !applyMsg.CommandValid {  //非状态机apply消息
+		if command, ok := applyMsg.Command.(raft.LogSnapshot); ok { //更新快照消息
 			kv.updateSnapshot(command.Datas)
-		}
+		} 
+		kv.ifSaveSnapshot()
 		return
 	}
-	if command, ok := applyMsg.Command.(PutAppendCommand); ok {
-		if !kv.isRepeated(&command.Req) {
+	//更新日志索引，用于创建最新快照
+	kv.logApplyIndex = applyMsg.CommandIndex
+	if command, ok := applyMsg.Command.(PutAppendCommand); ok { //Put && append操作
+		if !kv.isRepeatedWithUpdate(&command.Req) { //去重复
 			kv.putAppend(&command.Req)
-			kv.ifSaveSnapshot(applyMsg.CommandIndex)
 		}
 		select {
 		case command.Ch <- true:
 		default:
 		}
-	} else {
+	} else { //Get操作
 		command := applyMsg.Command.(GetCommand)
 		select {
 		case command.Ch <- kv.get(&command.Req):
 		default:
 		}	
 	}
+	kv.ifSaveSnapshot()
 }
 
+//轮询
 func (kv *KVServer) mainLoop() {
 	for {
 		select {
 		case <-kv.killChan:
 			return
 		case msg := <-kv.applyCh:
+			if cap(kv.applyCh) - len(kv.applyCh) < 5 {
+				log.Println("warn : maybe dead lock...")
+			}
 			kv.onApply(msg)
 		}
 	}
@@ -195,12 +221,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-	kv.applyCh = make(chan raft.ApplyMsg, 1024)
+	kv.applyCh = make(chan raft.ApplyMsg, 10000)
 	kv.kvs = make(map[string]string)
 	kv.msgIDs = make(map[int64]int64)
 	kv.killChan = make(chan (bool))
 	kv.persister = persister
 	kv.EnableDebugLog = false
+	kv.logApplyIndex = 0
 	kvOnce.Do(func() {
 		labgob.Register(PutAppendCommand{})
 		labgob.Register(GetCommand{})

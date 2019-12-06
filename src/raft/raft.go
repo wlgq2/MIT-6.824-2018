@@ -35,7 +35,7 @@ type LogEntry struct {
 	Index int
 	Log   interface{}
 }
-
+//日志快照
 type LogSnapshot struct {
 	Term  int
 	Index int
@@ -180,7 +180,7 @@ func (rf *Raft) setStatus(status int) {
 	if rf.status != Leader && status == Leader {
 		index := len(rf.logs)
 		for i := 0; i < len(rf.peers); i++ {
-			rf.nextIndex[i] = index + 1
+			rf.nextIndex[i] = index + 1 + rf.logSnapshot.Index
 			rf.matchIndex[i] = 0
 		}
 	}
@@ -321,18 +321,27 @@ func (rf *Raft) updateLog(start int, logEntrys []LogEntry,snapshot *LogSnapshot)
 	if snapshot.Index > 0 {   //更新快照
 		rf.logSnapshot = *snapshot
 		start = rf.logSnapshot.Index
-		rf.println(rf.me,"update snapshot",rf.logSnapshot.Index)
+		rf.println("update snapshot :",rf.me,rf.logSnapshot.Index,"len logs",len(logEntrys))
 	}
 	index := start - rf.logSnapshot.Index
 	for i := 0; i < len(logEntrys); i++ {
+		if index+i <0 {
+			//网络不可靠，fallower节点成功apply并保存快照后，Leader未收到反馈，重复发送日志，
+			//可能会导致index <0情况。
+			continue
+		}
 		if index+i < len(rf.logs) {
 			rf.logs[index+i] = logEntrys[i]
 		} else {
 			rf.logs = append(rf.logs, logEntrys[i])
 		}
 	}
+	size  := index+len(logEntrys)
+	if size <0 { //网络不可靠+各节点独立备份快照可能出现
+		size =0
+	}
 	//重置log大小
-	rf.logs = rf.logs[:index+len(logEntrys)]
+	rf.logs = rf.logs[:size]
 }
 
 //插入日志
@@ -362,6 +371,8 @@ func (rf *Raft) updateCommitIndex() bool {
 	rf.matchIndex[rf.me] = 0
 	if len(rf.logs) > 0 {
 		rf.matchIndex[rf.me] = rf.logs[len(rf.logs)-1].Index
+	} else {
+		rf.matchIndex[rf.me] = rf.logSnapshot.Index
 	}
 	for i := 0; i < len(rf.matchIndex); i++ {
 		indexs = append(indexs, rf.matchIndex[i])
@@ -384,10 +395,7 @@ func (rf *Raft) apply() {
 	if rf.status == Leader {
 		rf.updateCommitIndex()
 	}
-	last := 0
-	if len(rf.logs) > 0 {
-		last = rf.logs[len(rf.logs)-1].Index
-	}
+
 	lastapplied := rf.lastApplied
 	if rf.lastApplied< rf.logSnapshot.Index {
 		msg := ApplyMsg{
@@ -399,7 +407,10 @@ func (rf *Raft) apply() {
 		rf.lastApplied = rf.logSnapshot.Index
 		rf.println(rf.me,"apply snapshot :", rf.logSnapshot.Index,"with logs:",len(rf.logs))
 	}
-
+	last := 0
+	if len(rf.logs) > 0 {
+		last = rf.logs[len(rf.logs)-1].Index
+	}
 	for ; rf.lastApplied < rf.commitIndex && rf.lastApplied < last; rf.lastApplied++ {
 		index := rf.lastApplied
 		msg := ApplyMsg{
@@ -419,7 +430,7 @@ func (rf *Raft) apply() {
 			endTerm = rf.logs[rf.lastApplied-1-rf.logSnapshot.Index].Term
 			endIndex = rf.logs[rf.lastApplied-1-rf.logSnapshot.Index].Index
 		}
-		rf.println(rf.me, "apply log", rf.lastApplied-1,endTerm, "-", endIndex)
+		rf.println(rf.me, "apply log", rf.lastApplied-1,endTerm, "-", endIndex,"/",last)
 	}
 }
 
@@ -462,6 +473,13 @@ func (rf *Raft) persist() {
 	//rf.persister.SaveRaftState(data)
 	rf.unlock("Raft.persist")
 	rf.persister.SaveStateAndSnapshot(data,rf.logSnapshot.Datas)
+	//持久化数据后，apply 通知触发快照
+	msg := ApplyMsg{
+		CommandValid: false,
+		Command:     nil,
+		CommandIndex: 0,
+	}
+	rf.applyCh <- msg
 }
 
 func (rf *Raft) readPersist(data []byte) {
@@ -638,21 +656,10 @@ func (rf *Raft) RequestAppendEntries(req *AppendEntries, resp *RespEntries) {
 	}
 	//更新日志
 	rf.setLastLog(req)
-	startTerm,startIndex,endTerm,endIndex  := -1,-1,-1,-1
-	if len(req.Entries) > 0 {
-		startTerm = req.Entries[0].Term
-		startIndex = req.Entries[0].Index
-		endTerm = req.Entries[len(req.Entries)-1].Term
-		endIndex = req.Entries[len(req.Entries)-1].Index
-	}
-	if req.Snapshot.Index > 0 {
-		startIndex = 1
-		if endIndex == -1 {
-			endIndex = req.Snapshot.Index
+	if  len(req.Entries) > 0 || req.Snapshot.Index > 0 {
+		if len(req.Entries) > 0{
+			rf.println(rf.me, "update log from ", req.Me, ":", req.Entries[0].Term, "-", req.Entries[0].Index, "to", req.Entries[len(req.Entries)-1].Term, "-", req.Entries[len(req.Entries)-1].Index)
 		}
-	}
-	if  endIndex > 0 {
-		rf.println(rf.me, "update log from ", req.Me, ":", startTerm, "-", startIndex, "to", endTerm, "-", endIndex)
 		rf.updateLog(req.PrevLogIndex, req.Entries,&req.Snapshot)
 	}
 	rf.setCommitIndex(req.LeaderCommit)
@@ -692,6 +699,9 @@ func (rf *Raft) replicateLogTo(peer int) bool {
 			} else { //更新成功
 				if len(req.Entries) > 0 {
 					rf.setNextAndMatch(peer, req.Entries[len(req.Entries)-1].Index)
+					replicateRst = true
+				} else if req.Snapshot.Index >0 {
+					rf.setNextAndMatch(peer, req.Snapshot.Index)
 					replicateRst = true
 				}
 			}
@@ -761,7 +771,6 @@ func (rf *Raft) SaveSnapshot(index int,snapshot []byte) {
 	rf.lock("Raft.SaveSnapshot")
 	if index > rf.logSnapshot.Index {
 		//保存快照
-		rf.println(rf.me,"save snapshot :",index,",len logs:",len(rf.logs))
 		start := rf.logSnapshot.Index
 		rf.logSnapshot.Index = index
 		rf.logSnapshot.Datas = snapshot
@@ -770,10 +779,13 @@ func (rf *Raft) SaveSnapshot(index int,snapshot []byte) {
 		if len(rf.logs) >0 {
 			rf.logs = rf.logs[(index-start):]
 		}
-		rf.println(rf.me,"after save snapshot len logs:",len(rf.logs))
+		rf.println("save snapshot :",rf.me,index,",len logs:",len(rf.logs))
+		rf.unlock("Raft.SaveSnapshot")
+		rf.persist()
+	} else {
+		rf.unlock("Raft.SaveSnapshot")
 	}
-	rf.unlock("Raft.SaveSnapshot")
-	rf.persist()
+	
 }
 
 func Make(peers []*labrpc.ClientEnd, me int,
