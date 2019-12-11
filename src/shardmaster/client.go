@@ -38,7 +38,6 @@ func (ck *Clerk) Query(num int) Config {
 		Num :num,
 	}
 	for {
-		// try each known server.
 		for _, srv := range ck.servers {
 			var reply QueryReply
 			ok := srv.Call("ShardMaster.Query", args, &reply)

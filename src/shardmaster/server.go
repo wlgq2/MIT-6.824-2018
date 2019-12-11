@@ -25,21 +25,32 @@ type ShardMaster struct {
 	killChan       chan (bool)
 
 	configs []Config // indexed by config num
+	EnableDebugLog bool
 }
+
+func (sm *ShardMaster) println(args ...interface{}) {
+	if sm.EnableDebugLog {
+		log.Println(args...)
+	}
+}
+
 
 func (sm *ShardMaster) getCurrentConfig() Config {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	return sm.configs[len(sm.configs)-1]
+	config := sm.configs[len(sm.configs)-1]
+	CopyGroups(&config,config.Groups)
+	return config
 }
 
 func (sm *ShardMaster) getConfig(index int, config *Config) bool {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	if index >0 && index < len(sm.configs) {
+	if index >=0 && index < len(sm.configs) {
 		*config = sm.configs[index]
 		return true
 	}
+	*config = sm.configs[len(sm.configs)-1]
 	return false
 }
 
@@ -80,7 +91,6 @@ func (sm *ShardMaster) opt(client int64,msgId int64,req interface{}) (bool,inter
 	case resp := <-op.Ch:
 		return true,resp
 	case <-time.After(time.Millisecond * 800): //超时
-		
 	}
 	return false,nil
 }
@@ -122,36 +132,49 @@ func (sm *ShardMaster) Raft() *raft.Raft {
 	return sm.rf
 }
 
-func (sm *ShardMaster) join(args *JoinArgs ) bool {
-	if !sm.isRepeated(args.Me,args.MsgId,true) { 
+func (sm *ShardMaster) join(args *JoinArgs) bool {
+	sm.println("on join ",GetGroupsInfoString(args.Servers))
+	if sm.isRepeated(args.Me,args.MsgId,true) { 
 		return true
 	}
 	config := sm.getCurrentConfig()
-	if config.Num == 0 {
+	if config.Num == 0{
 		config.Groups = args.Servers
 		DistributionGroups(&config)
 	} else {
 		MergeGroups(&config, args.Servers)
 	}
 	sm.appendConfig(&config)
+	sm.println("after join ",GetShardsInfoString(&(config.Shards)))
 	return  true
 }
 
 func (sm *ShardMaster) leave(args *LeaveArgs) bool {
-	if !sm.isRepeated(args.Me,args.MsgId,true) { 
+	sm.println("on leave ",GetSlientInfoString(args.GIDs))
+	if sm.isRepeated(args.Me,args.MsgId,true) { 
 		return true
 	}
+	config := sm.getCurrentConfig()
+	DeleteGroups(&config,args.GIDs)
+	sm.appendConfig(&config)
+	sm.println("after leave ",GetShardsInfoString(&(config.Shards)))
 	return true
 }
 
 func (sm *ShardMaster) move(args *MoveArgs,) bool{
-	if !sm.isRepeated(args.Me,args.MsgId,true) { 
+	if sm.isRepeated(args.Me,args.MsgId,true) { 
 		return true
 	}
+	config := sm.getCurrentConfig()
+	config.Shards[args.Shard] = args.GID
+	sm.appendConfig(&config)
+	sm.println("on move ",args.Shard,args.GID)
+	sm.println("after move ",GetShardsInfoString(&(config.Shards)))
 	return true
 }
 
-func (sm *ShardMaster) query(args *QueryArgs) Config{
+func (sm *ShardMaster) query(args *QueryArgs) Config {
+	//sm.println("on query ",args.Num)
 	reply := Config {}
 	sm.getConfig(args.Num,&reply)
 	return reply
@@ -195,21 +218,24 @@ func (sm *ShardMaster)  mainLoop() {
 
 
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister) *ShardMaster {
+	smOnce.Do(func() {
+		labgob.Register(Op{})
+		labgob.Register(JoinArgs{})
+		labgob.Register(LeaveArgs{})
+		labgob.Register(MoveArgs{})
+		labgob.Register(QueryArgs{})
+	})
 	sm := new(ShardMaster)
 	sm.me = me
 
 	sm.configs = make([]Config, 1)
 	sm.configs[0].Groups = map[int][]string{}
-
-	sm.rf = raft.Make(servers, me, persister, sm.applyCh)
-
 	sm.applyCh = make(chan raft.ApplyMsg, 1024)
+	sm.rf = raft.Make(servers, me, persister, sm.applyCh)
 	sm.msgIDs = make(map[int64]int64)
 	sm.killChan = make(chan (bool))
-	smOnce.Do(func() {
-		labgob.Register(Op{})
-	})
 	go sm.mainLoop()
-	//sm.rf.EnableDebugLog = true
+	sm.EnableDebugLog = false
+	sm.rf.EnableDebugLog = false
 	return sm
 }
