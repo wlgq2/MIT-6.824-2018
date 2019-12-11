@@ -34,7 +34,7 @@ func (sm *ShardMaster) println(args ...interface{}) {
 	}
 }
 
-
+//获取最新配置
 func (sm *ShardMaster) getCurrentConfig() Config {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -42,7 +42,7 @@ func (sm *ShardMaster) getCurrentConfig() Config {
 	CopyGroups(&config,config.Groups)
 	return config
 }
-
+//获取历史配置
 func (sm *ShardMaster) getConfig(index int, config *Config) bool {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -53,14 +53,14 @@ func (sm *ShardMaster) getConfig(index int, config *Config) bool {
 	*config = sm.configs[len(sm.configs)-1]
 	return false
 }
-
+//更新配置
 func (sm *ShardMaster) appendConfig(config *Config) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	config.Num = len(sm.configs)
 	sm.configs = append(sm.configs, *config)
 }
-
+//判定重复请求
 func (sm *ShardMaster) isRepeated(client int64,msgId int64,update bool) bool {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -74,18 +74,18 @@ func (sm *ShardMaster) isRepeated(client int64,msgId int64,update bool) bool {
 	}
 	return rst
 }
-
+//raft同步操作
 func (sm *ShardMaster) opt(client int64,msgId int64,req interface{}) (bool,interface{}) {
 	if msgId > 0 && sm.isRepeated(client,msgId,false) {
 		return true,nil
 	}
 	op := Op {
-		Command : req,
-		Ch : make(chan(interface{})),
+		Command : req, //请求数据
+		Ch : make(chan(interface{})), //日志提交chan
 	}
-	_, _, isLeader := sm.rf.Start(op)
+	_, _, isLeader := sm.rf.Start(op) //写入Raft
 	if !isLeader {
-		return false,nil
+		return false,nil  //判定是否是leader
 	}
 	select {
 	case resp := <-op.Ch:
@@ -94,22 +94,22 @@ func (sm *ShardMaster) opt(client int64,msgId int64,req interface{}) (bool,inter
 	}
 	return false,nil
 }
-
+//增加组
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	ok,_ := sm.opt(args.Me,args.MsgId,*args)
 	reply.WrongLeader = !ok
 }
-
+//删除组
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	ok,_ := sm.opt(args.Me,args.MsgId,*args)
 	reply.WrongLeader = !ok
 }
-
+//移动组
 func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 	ok,_ := sm.opt(args.Me,args.MsgId,*args)
 	reply.WrongLeader = !ok
 }
-
+//查询组分片配置
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	if sm.getConfig(args.Num, &reply.Config) {
 		reply.WrongLeader = false
@@ -134,15 +134,15 @@ func (sm *ShardMaster) Raft() *raft.Raft {
 
 func (sm *ShardMaster) join(args *JoinArgs) bool {
 	sm.println("on join ",GetGroupsInfoString(args.Servers))
-	if sm.isRepeated(args.Me,args.MsgId,true) { 
+	if sm.isRepeated(args.Me,args.MsgId,true) { //去重复
 		return true
 	}
-	config := sm.getCurrentConfig()
-	if config.Num == 0{
+	config := sm.getCurrentConfig() //最新配置
+	if config.Num == 0{  //如果第一次配置，则重分配
 		config.Groups = args.Servers
-		DistributionGroups(&config)
+		DistributionGroups(&config) //重分配分片与组
 	} else {
-		MergeGroups(&config, args.Servers)
+		MergeGroups(&config, args.Servers) //合并组
 	}
 	sm.appendConfig(&config)
 	sm.println("after join ",GetShardsInfoString(&(config.Shards)))
@@ -155,7 +155,7 @@ func (sm *ShardMaster) leave(args *LeaveArgs) bool {
 		return true
 	}
 	config := sm.getCurrentConfig()
-	DeleteGroups(&config,args.GIDs)
+	DeleteGroups(&config,args.GIDs) //删除组
 	sm.appendConfig(&config)
 	sm.println("after leave ",GetShardsInfoString(&(config.Shards)))
 	return true
@@ -201,7 +201,7 @@ func (sm *ShardMaster)onApply(applyMsg raft.ApplyMsg) {
 		default:
 	}
 }
-
+//主循环
 func (sm *ShardMaster)  mainLoop() {
 	for {
 		select {
