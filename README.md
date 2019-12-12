@@ -6,5 +6,5 @@ https://pdos.csail.mit.edu/6.824/
 - [x] Raft
 - [x] Raft K/V Service
 - [ ] Sharded K/V Service
-  - [x] PartA
-  - [ ] PartB
+  - [x] shard master
+  - [ ] kv service
