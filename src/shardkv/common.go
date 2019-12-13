@@ -1,6 +1,7 @@
 package shardkv
 
 import "shardmaster"
+import "strconv"
 //
 // Sharded key/value server.
 // Lots of replica groups, each running op-at-a-time paxos.
@@ -64,4 +65,25 @@ type ReqDeleteShared struct {
 type RespDeleteShared struct {
 	Shard int
 	Config shardmaster.Config
+}
+
+
+func GetGroupShards(Shards *[shardmaster.NShards]int, group int) map[int]int {
+	rst := make(map[int]int)
+	for i := 0; i < len(*Shards); i++ {
+		if (*Shards)[i] == group {
+			rst[i] = group
+		}
+	}
+	return rst
+}
+
+func GetGroupShardsString(shards map[int]int) (rst string ){
+	for key,value := range shards {
+		rst += strconv.Itoa(key)
+		rst += " from "
+		rst += strconv.Itoa(value)
+		rst += ","
+	}
+	return rst
 }
