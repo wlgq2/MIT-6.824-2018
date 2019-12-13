@@ -13,6 +13,8 @@ import "crypto/rand"
 import "math/big"
 import "shardmaster"
 import "time"
+import "sync/atomic"
+//import "log"
 
 //
 // which shard is a key in?
@@ -39,7 +41,8 @@ type Clerk struct {
 	sm       *shardmaster.Clerk
 	config   shardmaster.Config
 	make_end func(string) *labrpc.ClientEnd
-	// You will have to modify this struct.
+	me       int64 
+	msgId    int64
 }
 
 //
@@ -55,7 +58,8 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck := new(Clerk)
 	ck.sm = shardmaster.MakeClerk(masters)
 	ck.make_end = make_end
-	// You'll have to add code here.
+	ck.me = nrand()
+	ck.msgId = 0
 	return ck
 }
 
@@ -66,11 +70,12 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
-
+	shard := key2shard(key)
+	args := GetArgs{
+		Key :key,
+		Shard :shard,
+	}
 	for {
-		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
@@ -99,14 +104,16 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
-
-
+	shard := key2shard(key)
+	args := PutAppendArgs{
+		Key :key,
+		Value : value,
+		Op :op,
+		Me :ck.me,
+		MsgId :atomic.AddInt64(&ck.msgId, 1),
+		Shard : shard ,
+	}
 	for {
-		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {

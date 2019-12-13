@@ -9,6 +9,7 @@ import "labgob"
 import "log"
 import "time"
 import "bytes"
+import "shardmaster"
 
 type Op struct {
 	Ch  chan (interface{})
@@ -27,11 +28,14 @@ type ShardKV struct {
 	masters      []*labrpc.ClientEnd
 	maxraftstate int // snapshot if log grows this big
 
-	kvs            map[string]string
+	kvs            [shardmaster.NShards] map[string]string
 	msgIDs         map[int64] int64
 	killChan       chan (bool)
 	persister      *raft.Persister
 	logApplyIndex  int
+	
+	config         shardmaster.Config
+	mck            *shardmaster.Clerk
 	EnableDebugLog bool
 }
 
@@ -40,11 +44,57 @@ func (kv *ShardKV) println(args ...interface{}) {
 		log.Println(args...)
 	}
 }
-//raft操作
-func (kv *ShardKV) opt(client int64,msgId int64,req interface{}) (bool,interface{}) {
-	if msgId > 0 && kv.isRepeated(client,msgId,false) { //去重
-		return true,nil
+//判定重复请求
+func (kv *ShardKV) isRepeated(client int64,msgId int64,update bool) bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	rst := false
+	index,ok := kv.msgIDs[client]
+	if ok {
+		rst = index >= msgId
 	}
+	if update && !rst {
+		kv.msgIDs[client] = msgId
+	}
+	return rst
+}
+
+//判定重复请求
+func (kv *ShardKV) setConfig(config *shardmaster.Config) bool  {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if config.Num > kv.config.Num {
+		kv.config = *config
+		kv.println(kv.me,"update config",config.Num)
+		return true
+	}
+	return false
+}
+//raft更新config
+func (kv *ShardKV) startConfig(config *shardmaster.Config) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if config.Num > kv.config.Num {
+		op := Op {
+			Req : *config, //请求数据
+			Ch : make(chan(interface{})), //日志提交chan
+		}
+		kv.rf.Start(op) //写入Raft
+	}
+}
+
+//判定重复请求
+func (kv *ShardKV) isTrueGroup(shard int) bool{
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if kv.config.Num == 0 {
+		return false
+	}
+	return kv.config.Shards[shard] == kv.gid
+}
+
+//raft操作
+func (kv *ShardKV) opt(req interface{}) (bool,interface{}) {
 	op := Op {
 		Req : req, //请求数据
 		Ch : make(chan(interface{}),1), //日志提交chan
@@ -62,38 +112,55 @@ func (kv *ShardKV) opt(client int64,msgId int64,req interface{}) (bool,interface
 }
 
 func (kv *ShardKV) Get(req *GetArgs, reply *GetReply) {
-	ok,value := kv.opt(-1,-1,*req)
+	ok,value := kv.opt(*req)
 	reply.WrongLeader = !ok
 	if ok {
-		reply.Value = value.(string)
+		*reply = value.(GetReply)
 	}
 }
 
 func (kv *ShardKV) PutAppend(req *PutAppendArgs, reply *PutAppendReply) {
-	ok,_ := kv.opt(req.Me,req.MsgId,*req)
+	ok,value := kv.opt(*req)
 	reply.WrongLeader = !ok
+	if ok {
+		reply.Err = value.(Err)
+	}
 }
 //写操作
-func (kv *ShardKV) putAppend(req *PutAppendArgs) {
-	kv.println(kv.me,"on",req.Op,req.Key,":",req.Value)
-	if req.Op == "Put" {
-		kv.kvs[req.Key] = req.Value
-	} else if req.Op == "Append" {
-		value, ok := kv.kvs[req.Key]
-		if !ok {
-			value = ""
-		}
-		value += req.Value
-		kv.kvs[req.Key] = value
+func (kv *ShardKV) putAppend(req *PutAppendArgs) Err {
+	if !kv.isTrueGroup(req.Shard) {
+		return ErrWrongGroup
 	}
+	if !kv.isRepeated(req.Me,req.MsgId,true) { //去重复
+		kv.println(kv.me,"on",req.Op,req.Shard,req.Key,":",req.Value)
+		if req.Op == "Put" {
+			kv.kvs[req.Shard][req.Key] = req.Value
+		} else if req.Op == "Append" {
+			value, ok := kv.kvs[req.Shard][req.Key]
+			if !ok {
+				value = ""
+			}
+			value += req.Value
+			kv.kvs[req.Shard][req.Key] = value
+		}
+	}
+	return OK
 }
 //读操作
-func (kv *ShardKV) get(args *GetArgs) (value string) {
-	value, ok := kv.kvs[args.Key]
+func (kv *ShardKV) get(req *GetArgs) (resp GetReply) {
+	if !kv.isTrueGroup(req.Shard) {
+		resp.Err = ErrWrongGroup
+		return 
+	}
+	value, ok := kv.kvs[req.Shard][req.Key]
+	resp.WrongLeader = false
+	resp.Err = OK
 	if !ok {
 		value = ""
+		resp.Err = ErrNoKey
 	}
-	kv.println(kv.me,"on get",args.Key,":",value)
+	resp.Value = value
+	kv.println(kv.me,"on get",req.Shard,req.Key,":",value)
 	return 
 }
 
@@ -102,20 +169,7 @@ func (kv *ShardKV) Kill() {
 	kv.killChan <- true
 }
 
-//判定重复请求
-func (kv *ShardKV) isRepeated(client int64,msgId int64,update bool) bool {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	rst := false
-	index,ok := kv.msgIDs[client]
-	if ok {
-		rst = index >= msgId
-	}
-	if update && !rst {
-		kv.msgIDs[client] = msgId
-	}
-	return rst
-}
+
 
 //判定是否写入快照
 func  (kv *ShardKV) ifSaveSnapshot() {
@@ -156,13 +210,11 @@ func (kv *ShardKV) onApply(applyMsg raft.ApplyMsg) {
 	opt := applyMsg.Command.(Op)
 	var resp interface{}
 	if command, ok := opt.Req.(PutAppendArgs); ok { //Put && append操作
-		if !kv.isRepeated(command.Me,command.MsgId,true) { //去重复
-			kv.putAppend(&command)
-		}
-		resp = true
-	} else { //Get操作
-		command := opt.Req.(GetArgs)
+		resp = kv.putAppend(&command)
+	} else if command, ok := opt.Req.(GetArgs); ok { //Get操作
 		resp = kv.get(&command)
+	} else if command, ok := opt.Req.(shardmaster.Config);ok {  //更新config
+		kv.setConfig(&command)
 	}
 	select {
 		case opt.Ch <- resp :
@@ -171,17 +223,31 @@ func (kv *ShardKV) onApply(applyMsg raft.ApplyMsg) {
 	kv.ifSaveSnapshot()
 }
 
+//获取最新配置
+func (kv *ShardKV) updateConfig()  {
+	if _, isLeader := kv.rf.GetState(); isLeader {
+		config := kv.mck.Query(-1)
+		kv.startConfig(&config)
+	}
+}
+
 //轮询
 func (kv *ShardKV) mainLoop() {
+	duration := time.Duration(time.Millisecond * 100)
+	timer := time.NewTimer(duration)
+	//kv.getConfig()
 	for {
 		select {
 		case <-kv.killChan:
 			return
 		case msg := <-kv.applyCh:
 			if cap(kv.applyCh) - len(kv.applyCh) < 5 {
-				log.Println("warn : maybe dead lock...")
+				log.Println(kv.me,"warn : maybe dead lock...")
 			}
 			kv.onApply(msg)
+		case <-timer.C :
+			kv.updateConfig()
+			timer.Reset(duration)
 		}
 	}
 }
@@ -214,6 +280,7 @@ func (kv *ShardKV) mainLoop() {
 // StartServer() must return quickly, so it should start goroutines
 // for any long-running work.
 //
+
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, masters []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
@@ -225,9 +292,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.make_end = make_end
 	kv.gid = gid
 	kv.masters = masters
-
 	
-	kv.kvs = make(map[string]string)
+	for i:=0;i<shardmaster.NShards;i++ {
+		kv.kvs[i] = make(map[string]string)
+	}
 	kv.msgIDs = make(map[int64]int64)
 	kv.killChan = make(chan (bool))
 	kv.persister = persister
@@ -237,16 +305,18 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		labgob.Register(Op{})
 		labgob.Register(PutAppendArgs{})
 		labgob.Register(GetArgs{})
+		labgob.Register(ReqShared{})
+		labgob.Register(RespShared{})
+		labgob.Register(ReqDeleteShared{})
+		labgob.Register(RespDeleteShared{})
+		labgob.Register(shardmaster.Config{})
 	})
-	go kv.mainLoop()
-
-	// Your initialization code here.
-
-	// Use something like this to talk to the shardmaster:
-	// kv.mck = shardmaster.MakeClerk(kv.masters)
-
 	kv.applyCh = make(chan raft.ApplyMsg, 10000)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.mck = shardmaster.MakeClerk(kv.masters)
 	kv.rf.EnableDebugLog = false
+	kv.EnableDebugLog = false
+	kv.config.Num = 0
+	go kv.mainLoop()
 	return kv
 }
