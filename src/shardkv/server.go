@@ -185,10 +185,8 @@ func (kv *ShardKV) GetShard(req *ReqShared, reply *RespShared) {
 }
 
 func (kv *ShardKV) Kill() {
-	kv.println(kv.gid,kv.me,"kill")
 	kv.rf.Kill()
 	kv.killChan <- true
-	kv.println(kv.gid,kv.me,"after kill")
 }
 
 //判定是否写入快照
@@ -233,8 +231,6 @@ func (kv *ShardKV) putAppend(req *PutAppendArgs) Err {
 			value += req.Value
 			kv.kvs[req.Shard][req.Key] = value
 		}
-	} else {
-		kv.println(kv.gid,kv.me,"repeat",req.Op,req.Shard,"client",req.Me,"msgid:",req.MsgId,req.Key,":",req.Value)
 	}
 	return OK
 }
@@ -405,7 +401,6 @@ func (kv *ShardKV) getShardLoop() {
 							server := kv.make_end(servers[i])
 							ok := server.Call("ShardKV.GetShard", &req, &reply)
 							if ok && reply.Successed {
-								kv.println(kv.gid,kv.me,"get shard success",group)
 								complet = true
 								break
 							}
@@ -426,7 +421,6 @@ func (kv *ShardKV) getShardLoop() {
 			}(key,value)
 		}
 		wait.Wait()
-		kv.println(kv.gid,kv.me,"try start shards.")
 		//获取的状态写入RAFT，直到成功
 		for !(kv.cofigCompleted(Num)) {
 			respShards := RespShareds{
