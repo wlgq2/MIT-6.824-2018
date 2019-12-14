@@ -395,7 +395,7 @@ func (kv *ShardKV) getShardLoop() {
 					}
 					complet := false
 					var reply RespShared
-					for !complet && !(kv.cofigCompleted(Num)){
+					for !complet && !(kv.cofigCompleted(Num)) && !kv.killed {
 						for i := 0; i < len(servers); i++ {
 							server := kv.make_end(servers[i])
 							ok := server.Call("ShardKV.GetShard", &req, &reply)
@@ -403,7 +403,7 @@ func (kv *ShardKV) getShardLoop() {
 								complet = true
 								break
 							}
-							if kv.cofigCompleted(Num) {
+							if kv.cofigCompleted(Num) || kv.killed{
 								break
 							}
 							time.Sleep(time.Millisecond*10)
@@ -468,7 +468,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.mck = shardmaster.MakeClerk(kv.masters)
 	kv.rf.EnableDebugLog = false
-	kv.EnableDebugLog = true
+	kv.EnableDebugLog = false
 	kv.config.Num = 0
 	kv.nextConfig.Num = 0
 	kv.killed = false
