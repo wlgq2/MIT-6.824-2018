@@ -187,6 +187,7 @@ func (kv *ShardKV) GetShard(req *ReqShared, reply *RespShared) {
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	kv.killChan <- true
+	kv.killChan <- true
 }
 
 //判定是否写入快照
@@ -356,11 +357,11 @@ func (kv *ShardKV) updateConfig()  {
 
 //轮询
 func (kv *ShardKV) mainLoop() {
+	defer kv.println(kv.gid,kv.me,"Exit mainLoop")
 	duration := time.Duration(time.Millisecond * 100)
 	for {
 		select {
 		case <-kv.killChan:
-			kv.println(kv.gid,kv.me,"Exit mainLoop")
 			return
 		case msg := <-kv.applyCh:
 			if cap(kv.applyCh) - len(kv.applyCh) < 5 {
@@ -375,10 +376,17 @@ func (kv *ShardKV) mainLoop() {
 	
 }
 
+
 //请求其他组数据
 func (kv *ShardKV) getShardLoop() {
+	defer kv.println(kv.gid,kv.me,"Exit ShardLoop")
 	for !kv.killed {
-		groupShards := <-kv.shardCh 
+		groupShards := GroupShards{}
+		select {
+			case groupShards = <-kv.shardCh :
+			case <-kv.killChan:
+				return
+		}
 		Num := groupShards.Config.Num
 		var wait sync.WaitGroup
 		wait.Add(len(groupShards.Shards))
@@ -418,6 +426,9 @@ func (kv *ShardKV) getShardLoop() {
 				}
 				
 			}(key,value)
+		}
+		if kv.killed {
+			return 
 		}
 		wait.Wait()
 		//获取的状态写入RAFT，直到成功
@@ -468,7 +479,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.mck = shardmaster.MakeClerk(kv.masters)
 	kv.rf.EnableDebugLog = false
-	kv.EnableDebugLog = false
+	kv.EnableDebugLog = me == 0
 	kv.config.Num = 0
 	kv.nextConfig.Num = 0
 	kv.killed = false
