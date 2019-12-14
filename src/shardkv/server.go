@@ -380,7 +380,6 @@ func (kv *ShardKV) getShardLoop() {
 	for !kv.killed {
 		groupShards := <-kv.shardCh 
 		Num := groupShards.Config.Num
-		kv.println(kv.gid,kv.me,"get shard data config :",Num,len(groupShards.Shards))
 		var wait sync.WaitGroup
 		wait.Add(len(groupShards.Shards))
 		rst := make(map[int]RespShared)
@@ -404,7 +403,7 @@ func (kv *ShardKV) getShardLoop() {
 								complet = true
 								break
 							}
-							if !(kv.cofigCompleted(Num)) {
+							if kv.cofigCompleted(Num) {
 								break
 							}
 							time.Sleep(time.Millisecond*10)
