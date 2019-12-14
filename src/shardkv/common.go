@@ -46,14 +46,14 @@ type GetReply struct {
 }
 
 type ReqShared struct {
-	Shard int
+	Shards []int
 	Config shardmaster.Config
 }
 
 type RespShared struct {
+	Successed bool
 	Config  shardmaster.Config
-	Shard  int
-	Data    map[string]string
+	Data    map[int]map[string]string
 	MsgIDs  map[int64] int64
 }
 
@@ -72,6 +72,10 @@ type RespDeleteShared struct {
 	Config shardmaster.Config
 }
 
+type GroupShards struct {
+	Shards map[int][]int
+	Config shardmaster.Config
+}
 
 func GetGroupShards(Shards *[shardmaster.NShards]int, group int) map[int]int {
 	rst := make(map[int]int)
@@ -83,12 +87,15 @@ func GetGroupShards(Shards *[shardmaster.NShards]int, group int) map[int]int {
 	return rst
 }
 
-func GetGroupShardsString(shards map[int]int) (rst string ){
+func GetGroupShardsString(shards map[int][]int) (rst string ){
 	for key,value := range shards {
 		rst += strconv.Itoa(key)
-		rst += " from "
-		rst += strconv.Itoa(value)
-		rst += ","
+		rst += "{"
+		for i:=0;i<len(value);i++ {
+			rst += strconv.Itoa(value[i])
+			rst += ","
+		}
+		rst += "}"
 	}
 	return rst
 }
