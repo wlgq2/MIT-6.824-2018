@@ -61,10 +61,10 @@ func (kv *ShardKV) isRepeated(client int64,msgId int64) bool {
 }
 
 //判定cofig更新完成
-func (kv *ShardKV) cofigCompleted() bool {
+func (kv *ShardKV) cofigCompleted(Num int) bool {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	return kv.config.Num == kv.nextConfig.Num
+	return  kv.config.Num >= Num
 }
 //获取新增shards
 func (kv *ShardKV) getNewShards(config *shardmaster.Config) map[int]int {
@@ -253,15 +253,15 @@ func (kv *ShardKV) onSetShard(resp *RespShared) {
 	kv.kvs[resp.Shard] = resp.Data
 	//更新msgid
 	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	for key,value := range resp.MsgIDs {
-	id,ok := kv.msgIDs[key]
-	if !ok || id < value {
-		log.Println(kv.gid,kv.me,"update msg id",ok,key,id,value)
-		kv.msgIDs[key] = value
+		id,ok := kv.msgIDs[key]
+		if !ok || id < value {
+			log.Println(kv.gid,kv.me,"update msg id",ok,key,id,value)
+			kv.msgIDs[key] = value
 		}
 	}
 	kv.config = kv.nextConfig
-	kv.mu.Unlock()
 }
 
 func (kv *ShardKV) onGetShard(req *ReqShared) (resp RespShared) {
@@ -286,8 +286,11 @@ func (kv *ShardKV) onGetShard(req *ReqShared) (resp RespShared) {
 }
 
 func (kv *ShardKV) onConfig(config *shardmaster.Config) {
-	shards := kv.getNewShards(config) //获取新增分片
-	kv.shardCh<-shards
+	if config.Num > kv.nextConfig.Num {
+		shards := kv.getNewShards(config) //获取新增分片
+		shards[-1] = config.Num //写入config Num 
+		kv.shardCh<-shards
+	}
 }
 //apply 状态机
 func (kv *ShardKV) onApply(applyMsg raft.ApplyMsg) {
@@ -323,8 +326,10 @@ func (kv *ShardKV) onApply(applyMsg raft.ApplyMsg) {
 //获取新配置
 func (kv *ShardKV) updateConfig()  {
 	if _, isLeader := kv.rf.GetState(); isLeader {
-		config := kv.mck.Query(kv.nextConfig.Num+1)
-		kv.startConfig(&config)
+		if kv.nextConfig.Num == kv.config.Num {
+			config := kv.mck.Query(kv.nextConfig.Num+1)
+			kv.startConfig(&config)
+		}
 	}
 }
 
@@ -353,10 +358,12 @@ func (kv *ShardKV) mainLoop() {
 func (kv *ShardKV) getShardLoop() {
 	for !kv.killed {
 		shards := <-kv.shardCh 
+		Num := shards[-1]
+		delete(shards,-1)
 		var wait sync.WaitGroup
 		wait.Add(len(shards))
 		for key,value := range shards {  //遍历所有分片，请求数据
-			go func(shard int,group int){
+			go func(shard int,group int) {
 				servers, ok := kv.config.Groups[group]  //获取目标组服务
 				if ok {
 					req := ReqShared  {
@@ -365,7 +372,7 @@ func (kv *ShardKV) getShardLoop() {
 					}
 					complet := false
 					var reply RespShared
-					for !complet && !(kv.cofigCompleted()){
+					for !complet && !(kv.cofigCompleted(Num)){
 						for i := 0; i < len(servers); i++ {
 							server := kv.make_end(servers[i])
 							ok := server.Call("ShardKV.GetShard", &req, &reply)
@@ -376,7 +383,7 @@ func (kv *ShardKV) getShardLoop() {
 						}
 					}
 					//获取的状态写入RAFT，直到成功
-					for !(kv.cofigCompleted()) {
+					for !(kv.cofigCompleted(Num)) {
 						kv.startShard(&reply)
 						time.Sleep(time.Millisecond*1000)
 					}
