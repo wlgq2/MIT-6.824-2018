@@ -249,7 +249,7 @@ func (kv *ShardKV) get(req *GetArgs) (resp GetReply) {
 		resp.Err = ErrNoKey
 	}
 	resp.Value = value
-	//kv.println(kv.me,"on get",req.Shard,req.Key,":",value)
+	kv.println(kv.gid,kv.me,"on get",req.Shard,req.Key,":",value)
 	return 
 }
 func (kv *ShardKV) onSetShard(resp *RespShareds) {
@@ -460,7 +460,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		kv.kvs[i] = make(map[string]string)
 	}
 	kv.msgIDs = make(map[int64]int64)
-	kv.killChan = make(chan (bool))
+	kv.killChan = make(chan (bool),2)
 	kv.persister = persister
 	kv.EnableDebugLog = -1==me
 	kv.logApplyIndex = 0
@@ -479,7 +479,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.mck = shardmaster.MakeClerk(kv.masters)
 	kv.rf.EnableDebugLog = false
-	kv.EnableDebugLog = me == 0
+	kv.EnableDebugLog = false
 	kv.config.Num = 0
 	kv.nextConfig.Num = 0
 	kv.killed = false
