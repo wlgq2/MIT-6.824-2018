@@ -102,13 +102,13 @@ func (kv *ShardKV) setConfig(config *shardmaster.Config) bool  {
 	return false
 }
 //raft更新shard
-func (kv *ShardKV) startShard(shards map[int]RespShared) {
+func (kv *ShardKV) startShard(shards *RespShareds) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	kv.println("start shard ", kv.nextConfig.Num)
 	if kv.config.Num < kv.nextConfig.Num {
 		op := Op {
-			Req : shards, //请求数据
+			Req : *shards, //请求数据
 			Ch : make(chan(interface{})), //日志提交chan
 		}
 		kv.rf.Start(op) //写入Raft
@@ -249,15 +249,18 @@ func (kv *ShardKV) get(req *GetArgs) (resp GetReply) {
 	//kv.println(kv.me,"on get",req.Shard,req.Key,":",value)
 	return 
 }
-func (kv *ShardKV) onSetShard(resp map[int]RespShared) {
+func (kv *ShardKV) onSetShard(resp *RespShareds) {
+	if kv.cofigCompleted(resp.ConfigNum) { //数据已更新
+		return 
+	}
 	//更新数据
-	for key,value := range resp {
+	for key,value := range resp.Shards {
 		kv.kvs[key] = value.Data
 	}
 	//更新msgid
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	for _,shard := range resp {
+	for _,shard := range resp.Shards {
 		for key,value := range shard.MsgIDs {
 			id,ok := kv.msgIDs[key]
 			if !ok || id < value {
@@ -318,8 +321,8 @@ func (kv *ShardKV) onApply(applyMsg raft.ApplyMsg) {
 		kv.onConfig(&command)
 	} else if command, ok := opt.Req.(ReqShared);ok {  //更新config
 		resp = kv.onGetShard(&command)
-	} else if command, ok := opt.Req.(map[int]RespShared);ok {  //更新config
-		kv.onSetShard(command)
+	} else if command, ok := opt.Req.(RespShareds);ok {  //更新config
+		kv.onSetShard(&command)
 	}
 	select {
 		case opt.Ch <- resp :
@@ -403,7 +406,11 @@ func (kv *ShardKV) getShardLoop() {
 		wait.Wait()
 		//获取的状态写入RAFT，直到成功
 		for !(kv.cofigCompleted(Num)) {
-			kv.startShard(rst)
+			respShards := RespShareds{
+				ConfigNum : Num ,
+				Shards : rst,
+			} 
+			kv.startShard(&respShards)
 			time.Sleep(time.Millisecond*1000)
 		}
 	}
@@ -436,6 +443,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		labgob.Register(GetArgs{})
 		labgob.Register(ReqShared{})
 		labgob.Register(RespShared{})
+		labgob.Register(RespShareds{})
 		labgob.Register(ReqDeleteShared{})
 		labgob.Register(RespDeleteShared{})
 		labgob.Register(shardmaster.Config{})

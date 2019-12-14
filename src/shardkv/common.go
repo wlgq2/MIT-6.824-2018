@@ -57,6 +57,11 @@ type RespShared struct {
 	MsgIDs  map[int64] int64
 }
 
+type RespShareds struct {
+	ConfigNum  int
+	Shards     map[int]RespShared
+}
+
 type ReqDeleteShared struct {
 	Shard int
 	Config shardmaster.Config
