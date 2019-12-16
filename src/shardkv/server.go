@@ -111,13 +111,15 @@ func (kv *ShardKV) setConfig(config *shardmaster.Config) bool  {
 func (kv *ShardKV) startShard(shards *RespShareds) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	kv.println(kv.gid,kv.me,"start shard ", kv.nextConfig.Num)
 	if kv.config.Num < kv.nextConfig.Num {
 		op := Op {
 			Req : *shards, //请求数据
 			Ch : make(chan(interface{})), //日志提交chan
 		}
-		kv.rf.Start(op) //写入Raft
+		index,term,isLeader := kv.rf.Start(op) //写入Raft
+		if isLeader {
+			kv.println(kv.gid,kv.me,"start shard ", kv.nextConfig.Num,"term",term,"index",index)
+		}
 	}
 }
 //raft更新config
@@ -197,21 +199,26 @@ func  (kv *ShardKV) ifSaveSnapshot() {
 		encoder := labgob.NewEncoder(writer)
 		encoder.Encode(kv.msgIDs)
 		encoder.Encode(kv.kvs)
+		encoder.Encode(kv.config)
+		encoder.Encode(kv.nextConfig)
 		data := writer.Bytes()
 		kv.rf.SaveSnapshot(kv.logApplyIndex,data)
 		return 
 	}
 }
 //更新快照
-func  (kv *ShardKV) updateSnapshot(data []byte) {
+func  (kv *ShardKV) updateSnapshot(index int,data []byte) {
 	if data == nil || len(data) < 1 {
 		return
 	}
+	kv.logApplyIndex = index
 	reader := bytes.NewBuffer(data)
 	decoder := labgob.NewDecoder(reader)
 
 	if decoder.Decode(&kv.msgIDs) != nil ||
-		decoder.Decode(&kv.kvs) != nil  {
+		decoder.Decode(&kv.kvs) != nil   ||
+		decoder.Decode(&kv.config) != nil ||
+		decoder.Decode(&kv.nextConfig) != nil {
 		kv.println("Error in unmarshal raft state")
 	} 
 }
@@ -252,8 +259,10 @@ func (kv *ShardKV) get(req *GetArgs) (resp GetReply) {
 	kv.println(kv.gid,kv.me,"on get",req.Shard,req.Key,":",value)
 	return 
 }
+
 func (kv *ShardKV) onSetShard(resp *RespShareds) {
 	if kv.cofigCompleted(resp.ConfigNum) { //数据已更新
+		kv.println(kv.gid,kv.me,"not set config :",resp.ConfigNum)
 		return 
 	}
 	//更新数据
@@ -269,12 +278,12 @@ func (kv *ShardKV) onSetShard(resp *RespShareds) {
 		for key,value := range shard.MsgIDs {
 			id,ok := kv.msgIDs[key]
 			if !ok || id < value {
-				//log.Println(kv.gid,kv.me,"update msg id",ok,key,id,value)
 				kv.msgIDs[key] = value
 			}
 		}
 	}
 	kv.config = kv.nextConfig
+	kv.println(kv.gid,kv.me,"on set config :",kv.config.Num)
 }
 
 func (kv *ShardKV) onGetShard(req *ReqShared) (resp RespShared) {
@@ -314,11 +323,21 @@ func (kv *ShardKV) onConfig(config *shardmaster.Config) {
 		kv.shardCh<-groupShards
 	}
 }
+//获取新配置
+func (kv *ShardKV) updateConfig()  {
+	if _, isLeader := kv.rf.GetState(); isLeader {
+		if kv.nextConfig.Num == kv.config.Num {
+			config := kv.mck.Query(kv.nextConfig.Num+1)
+			kv.startConfig(&config)
+		}
+	}
+}
+
 //apply 状态机
 func (kv *ShardKV) onApply(applyMsg raft.ApplyMsg) {
 	if !applyMsg.CommandValid {  //非状态机apply消息
 		if command, ok := applyMsg.Command.(raft.LogSnapshot); ok { //更新快照消息
-			kv.updateSnapshot(command.Datas)
+			kv.updateSnapshot(command.Index,command.Datas)
 		} 
 		kv.ifSaveSnapshot()
 		return
@@ -341,20 +360,8 @@ func (kv *ShardKV) onApply(applyMsg raft.ApplyMsg) {
 	select {
 		case opt.Ch <- resp :
 		default:
-	}	
-	kv.ifSaveSnapshot()
-}
-
-//获取新配置
-func (kv *ShardKV) updateConfig()  {
-	if _, isLeader := kv.rf.GetState(); isLeader {
-		if kv.nextConfig.Num == kv.config.Num {
-			config := kv.mck.Query(kv.nextConfig.Num+1)
-			kv.startConfig(&config)
-		}
 	}
 }
-
 //轮询
 func (kv *ShardKV) mainLoop() {
 	defer kv.println(kv.gid,kv.me,"Exit mainLoop")
@@ -375,8 +382,6 @@ func (kv *ShardKV) mainLoop() {
 	}
 	
 }
-
-
 //请求其他组数据
 func (kv *ShardKV) getShardLoop() {
 	defer kv.println(kv.gid,kv.me,"Exit ShardLoop")

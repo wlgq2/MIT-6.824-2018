@@ -125,10 +125,11 @@ func  (kv *KVServer) ifSaveSnapshot() {
 	}
 }
 //更新快照
-func  (kv *KVServer) updateSnapshot(data []byte) {
+func  (kv *KVServer) updateSnapshot(index int,data []byte) {
 	if data == nil || len(data) < 1 {
 		return
 	}
+	kv.logApplyIndex = index
 	reader := bytes.NewBuffer(data)
 	decoder := labgob.NewDecoder(reader)
 
@@ -141,7 +142,7 @@ func  (kv *KVServer) updateSnapshot(data []byte) {
 func (kv *KVServer) onApply(applyMsg raft.ApplyMsg) {
 	if !applyMsg.CommandValid {  //非状态机apply消息
 		if command, ok := applyMsg.Command.(raft.LogSnapshot); ok { //更新快照消息
-			kv.updateSnapshot(command.Datas)
+			kv.updateSnapshot(command.Index,command.Datas)
 		} 
 		kv.ifSaveSnapshot()
 		return
