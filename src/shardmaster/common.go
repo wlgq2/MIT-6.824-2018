@@ -1,25 +1,8 @@
 package shardmaster
 
 import "strconv"
-//import "log"
-//
-// Master shard server: assigns shards to replication groups.
-//
-// RPC interface:
-// Join(servers) -- add a set of groups (gid -> server-list mapping).
-// Leave(gids) -- delete a set of groups.
-// Move(shard, gid) -- hand off one shard from current owner to gid.
-// Query(num) -> fetch Config # num, or latest config if num==-1.
-//
-// A Config (configuration) describes a set of replica groups, and the
-// replica group responsible for each shard. Configs are numbered. Config
-// #0 is the initial configuration, with no groups and all shards
-// assigned to group 0 (the invalid group).
-//
-// You will need to add fields to the RPC argument structs.
-//
+import "sort"
 
-// The number of shards.
 const NShards = 10
 
 // A configuration -- an assignment of shards to groups.
@@ -129,10 +112,22 @@ func DeleteGroups(config *Config, groups []int) {
 	}
 }
 
+//排序
+func SortGroup(groups map[int][]string)  []int {
+    var keys []int
+    for key,_ := range groups {
+        keys = append(keys, key)
+    }
+    sort.Ints(keys)	
+    return keys
+}
+
 //重新分配组和分片
 func DistributionGroups(config *Config) {
+	keys := SortGroup(config.Groups)
 	for index := 0; index < NShards; {
-		for key, _ := range config.Groups {
+		for i:=0;i<len(keys);i++ {
+		    key := keys[i]
 			config.Shards[index] = key
 			index++
 			if index >= NShards {
@@ -172,17 +167,25 @@ func GetCountShards(config *Config)  map[int][]int {
 	return rst
 }
 
+//排序
+func SortCountShards(shards map[int][]int)  []int {
+    var keys []int
+    for key,_ := range shards {
+        keys = append(keys, key)
+    }
+    sort.Ints(keys)	
+    return keys
+}
+
 //获取分片数量最多组
 func GetMaxCountShards(config *Config)(group int,rst []int) {
 	maps := GetCountShards(config)
+	keys := SortCountShards(maps)
 	max := 0
-	for key, value := range maps {
-		if key == 0 { //存在空组，则直接返回空组
-			group = key
-			rst = value
-			break
-		}
-		if len(value) > max {
+	for i:=0;i<len(keys);i++ {
+		key := keys[i]
+		value := maps[key]
+		if (len(value) > max) {
 			group = key
 			rst = value
 			max = len(value)
@@ -195,8 +198,12 @@ func GetMaxCountShards(config *Config)(group int,rst []int) {
 func GetMinCountShards(config *Config, without int) int {
 	rst := 0
 	maps := GetCountShards(config)
+	keys := SortCountShards(maps)
 	min := NShards + 1
-	for key, value := range maps {
+
+	for i:=0;i<len(keys);i++ {
+		key := keys[i]
+		value := maps[key]
 		if key == without {
 			continue
 		}
