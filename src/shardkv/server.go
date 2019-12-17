@@ -365,8 +365,8 @@ func (kv *ShardKV) onApply(applyMsg raft.ApplyMsg) {
 //轮询
 func (kv *ShardKV) mainLoop() {
 	defer kv.println(kv.gid,kv.me,"Exit mainLoop")
-	duration := time.Duration(time.Millisecond * 100)
-	for {
+	duration := time.Duration(time.Millisecond * 10)
+	for !kv.killed {
 		select {
 		case <-kv.killChan:
 			return
@@ -400,36 +400,38 @@ func (kv *ShardKV) getShardLoop() {
 		for key,value := range groupShards.Shards {  //遍历所有分片，请求数据
 			go func(group int,shards []int) {
 				defer wait.Done()
-				servers, ok := kv.config.Groups[group]  //获取目标组服务
-				if ok {
-					req := ReqShared  {
-						Config : kv.nextConfig,
-						Shards : shards,
-					}
-					complet := false
-					var reply RespShared
-					for !complet && !(kv.cofigCompleted(Num)) && !kv.killed {
-						for i := 0; i < len(servers); i++ {
-							server := kv.make_end(servers[i])
-							ok := server.Call("ShardKV.GetShard", &req, &reply)
-							if ok && reply.Successed {
-								complet = true
-								break
-							}
-							if kv.cofigCompleted(Num) || kv.killed{
-								break
-							}
-							time.Sleep(time.Millisecond*10)
+				complet := false
+				var reply RespShared
+				for !complet && !(kv.cofigCompleted(Num)) && !kv.killed {
+					servers, ok := kv.config.Groups[group]  //获取目标组服务
+					if !ok  {
+                        kv.println(kv.gid,kv.me,"Error : can not get group",group,"shard data")
+                        time.Sleep(time.Millisecond * 500)
+                        continue 
+                    }
+                    req := ReqShared  {
+                        Config : kv.nextConfig,
+                        Shards : shards,
+                    } 
+					for i := 0; i < len(servers); i++ {
+						server := kv.make_end(servers[i])
+						ok := server.Call("ShardKV.GetShard", &req, &reply)
+						if ok && reply.Successed {
+							complet = true
+							break
 						}
-					}
-					//存储该分片数据
-					if !kv.cofigCompleted(Num) {
-						mutex.Lock()
-						rst[group] = reply
-						mutex.Unlock()
+						if kv.cofigCompleted(Num) || kv.killed{
+							break
+						}
+						time.Sleep(time.Millisecond*10)
 					}
 				}
-				
+				//存储该分片数据
+				if !kv.cofigCompleted(Num) {
+					mutex.Lock()
+					rst[group] = reply
+					mutex.Unlock()
+				}
 			}(key,value)
 		}
 		if kv.killed {
@@ -437,7 +439,7 @@ func (kv *ShardKV) getShardLoop() {
 		}
 		wait.Wait()
 		//获取的状态写入RAFT，直到成功
-		for !(kv.cofigCompleted(Num)) {
+		for !(kv.cofigCompleted(Num)) && !kv.killed {
 			respShards := RespShareds{
 				ConfigNum : Num ,
 				Shards : rst,
@@ -467,7 +469,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.msgIDs = make(map[int64]int64)
 	kv.killChan = make(chan (bool),2)
 	kv.persister = persister
-	kv.EnableDebugLog = -1==me
 	kv.logApplyIndex = 0
 	shardKvOnce.Do(func() {
 		labgob.Register(Op{})
