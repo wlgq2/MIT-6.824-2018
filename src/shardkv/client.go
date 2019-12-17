@@ -80,6 +80,7 @@ func (ck *Clerk) Get(key string) string {
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
+				time.Sleep(10 * time.Millisecond)
 				srv := ck.make_end(servers[si])
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)

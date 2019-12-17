@@ -67,14 +67,14 @@ func (kv *ShardKV) cofigCompleted(Num int) bool {
 	return  kv.config.Num >= Num
 }
 //获取新增shards
-func (kv *ShardKV) getNewShards(config *shardmaster.Config) map[int][]int {
+func (kv *ShardKV) getNewShards() (map[int][]int,bool) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	shards := make(map[int][]int)
-	if config.Num > kv.config.Num {
-		if config.Num >1 {
+	if kv.nextConfig.Num > kv.config.Num {
+		if kv.nextConfig.Num >1 {
 			oldShards := GetGroupShards(&(kv.config.Shards),kv.gid) //旧该组分片
-			newShards := GetGroupShards(&(config.Shards),kv.gid) //新该组分片
+			newShards := GetGroupShards(&(kv.nextConfig.Shards),kv.gid) //新该组分片
 			for key,_ := range newShards {  //获取新增组
 				_,ok := oldShards[key]
 				if !ok {
@@ -88,14 +88,9 @@ func (kv *ShardKV) getNewShards(config *shardmaster.Config) map[int][]int {
 				}
 			}
 		}
-		kv.nextConfig = *config
-		kv.println(kv.gid,kv.me,"update config",config.Num,":",shardmaster.GetShardsInfoString(&(config.Shards)))
-		if len(shards) >0 {
-			kv.println(kv.gid,kv.me,"new shards",config.Num,":",GetGroupShardsString(shards))
-		}
-		return shards
+		return shards,true
 	}
-	return shards
+	return shards,false
 }
 
 func (kv *ShardKV) setConfig(config *shardmaster.Config) bool  {
@@ -141,7 +136,7 @@ func (kv *ShardKV) isTrueGroup(shard int) bool{
 	if kv.config.Num == 0 {
 		return false
 	}
-	return kv.config.Shards[shard] == kv.gid
+	return kv.config.Shards[shard] == kv.gid && kv.nextConfig.Num == kv.config.Num
 }
 
 //raft操作
@@ -187,8 +182,8 @@ func (kv *ShardKV) GetShard(req *ReqShared, reply *RespShared) {
 }
 
 func (kv *ShardKV) Kill() {
+	kv.killed = true
 	kv.rf.Kill()
-	kv.killChan <- true
 	kv.killChan <- true
 }
 
@@ -208,7 +203,7 @@ func  (kv *ShardKV) ifSaveSnapshot() {
 }
 //更新快照
 func  (kv *ShardKV) updateSnapshot(index int,data []byte) {
-	if data == nil || len(data) < 1 {
+	if data == nil || len(data) < 1 || kv.maxraftstate == -1 {
 		return
 	}
 	kv.logApplyIndex = index
@@ -220,7 +215,9 @@ func  (kv *ShardKV) updateSnapshot(index int,data []byte) {
 		decoder.Decode(&kv.config) != nil ||
 		decoder.Decode(&kv.nextConfig) != nil {
 		kv.println("Error in unmarshal raft state")
-	} 
+	} else {
+		kv.println(kv.gid,kv.me,"update snapshot",kv.logApplyIndex)
+	}
 }
 //写操作
 func (kv *ShardKV) putAppend(req *PutAppendArgs) Err {
@@ -228,7 +225,6 @@ func (kv *ShardKV) putAppend(req *PutAppendArgs) Err {
 		return ErrWrongGroup
 	}
 	if !kv.isRepeated(req.Me,req.MsgId) { //去重复
-		kv.println(kv.gid,kv.me,"on",req.Op,req.Shard,"client",req.Me,"msgid:",req.MsgId,req.Key,":",req.Value)
 		if req.Op == "Put" {
 			kv.kvs[req.Shard][req.Key] = req.Value
 		} else if req.Op == "Append" {
@@ -239,6 +235,7 @@ func (kv *ShardKV) putAppend(req *PutAppendArgs) Err {
 			value += req.Value
 			kv.kvs[req.Shard][req.Key] = value
 		}
+		kv.println(kv.gid,kv.me,"on",req.Op,req.Shard,"client",req.Me,"msgid:",req.MsgId,req.Key,":",req.Value,kv.kvs[req.Shard][req.Key])
 	}
 	return OK
 }
@@ -268,7 +265,9 @@ func (kv *ShardKV) onSetShard(resp *RespShareds) {
 	//更新数据
 	for _,value := range resp.Shards {
 		for shard,kvs := range value.Data {
-			kv.kvs[shard] = kvs
+			for key,data := range kvs {
+				kv.kvs[shard][key] = data
+			}
 		}
 	}
 	//更新msgid
@@ -315,12 +314,9 @@ func (kv *ShardKV) onGetShard(req *ReqShared) (resp RespShared) {
 
 func (kv *ShardKV) onConfig(config *shardmaster.Config) {
 	if config.Num > kv.nextConfig.Num {
-		shards := kv.getNewShards(config) //获取新增分片
-		groupShards := GroupShards {
-			Config : *config ,
-			Shards : shards ,
-		}
-		kv.shardCh<-groupShards
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		kv.nextConfig = *config
 	}
 }
 //获取新配置
@@ -352,9 +348,9 @@ func (kv *ShardKV) onApply(applyMsg raft.ApplyMsg) {
 		resp = kv.get(&command)
 	} else if command, ok := opt.Req.(shardmaster.Config);ok {  //更新config
 		kv.onConfig(&command)
-	} else if command, ok := opt.Req.(ReqShared);ok {  //更新config
+	} else if command, ok := opt.Req.(ReqShared);ok {  //其他组获取该组分片数据
 		resp = kv.onGetShard(&command)
-	} else if command, ok := opt.Req.(RespShareds);ok {  //更新config
+	} else if command, ok := opt.Req.(RespShareds);ok {  //获取其他组分片	
 		kv.onSetShard(&command)
 	}
 	select {
@@ -386,11 +382,18 @@ func (kv *ShardKV) mainLoop() {
 func (kv *ShardKV) getShardLoop() {
 	defer kv.println(kv.gid,kv.me,"Exit ShardLoop")
 	for !kv.killed {
-		groupShards := GroupShards{}
-		select {
-			case groupShards = <-kv.shardCh :
-			case <-kv.killChan:
-				return
+		shards,isUpdated := kv.getNewShards() //获取新增分片
+		groupShards := GroupShards {
+			Config : kv.nextConfig ,
+			Shards : shards ,
+		}
+		if !isUpdated {
+			time.Sleep(time.Millisecond*10)
+			continue
+		}
+		kv.println(kv.gid,kv.me,"update config",kv.nextConfig.Num,":",shardmaster.GetShardsInfoString(&(kv.nextConfig.Shards)))
+		if len(shards) >0 {
+			kv.println(kv.gid,kv.me,"new shards",kv.nextConfig.Num,":",GetGroupShardsString(shards))
 		}
 		Num := groupShards.Config.Num
 		var wait sync.WaitGroup
@@ -427,7 +430,7 @@ func (kv *ShardKV) getShardLoop() {
 					}
 				}
 				//存储该分片数据
-				if !kv.cofigCompleted(Num) {
+				if !kv.cofigCompleted(Num) && !kv.killed{
 					mutex.Lock()
 					rst[group] = reply
 					mutex.Unlock()
