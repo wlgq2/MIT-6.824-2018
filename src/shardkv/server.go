@@ -8,6 +8,7 @@ import "log"
 import "time"
 import "bytes"
 import "shardmaster"
+import "strconv"
 
 type Op struct {
 	Ch  chan (interface{})
@@ -35,9 +36,9 @@ type ShardKV struct {
 	
 	config         shardmaster.Config
 	nextConfig     shardmaster.Config
+	deleteShardsNum      int
 	mck            *shardmaster.Clerk
 	timer          *time.Timer         
-	shardCh        chan GroupShards
 	EnableDebugLog bool
 
 }
@@ -188,11 +189,11 @@ func (kv *ShardKV) Kill() {
 }
 
 //判定是否写入快照
-func  (kv *ShardKV) ifSaveSnapshot() {
-	if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
+func  (kv *ShardKV) ifSaveSnapshot(save bool) {
+	if kv.maxraftstate != -1 && (kv.persister.RaftStateSize() >= kv.maxraftstate || save){
 		writer := new(bytes.Buffer)
 		encoder := labgob.NewEncoder(writer)
-		encoder.Encode(kv.msgIDs)
+		encoder.Encode(kv.msgIDs)	
 		encoder.Encode(kv.kvs)
 		encoder.Encode(kv.config)
 		encoder.Encode(kv.nextConfig)
@@ -209,14 +210,14 @@ func  (kv *ShardKV) updateSnapshot(index int,data []byte) {
 	kv.logApplyIndex = index
 	reader := bytes.NewBuffer(data)
 	decoder := labgob.NewDecoder(reader)
-
+	for i:=0; i<len(kv.kvs); i++ {
+		kv.kvs[i] = make(map[string]string)
+	}
 	if decoder.Decode(&kv.msgIDs) != nil ||
 		decoder.Decode(&kv.kvs) != nil   ||
 		decoder.Decode(&kv.config) != nil ||
 		decoder.Decode(&kv.nextConfig) != nil {
 		kv.println("Error in unmarshal raft state")
-	} else {
-		kv.println(kv.gid,kv.me,"update snapshot",kv.logApplyIndex)
 	}
 }
 //写操作
@@ -257,6 +258,51 @@ func (kv *ShardKV) get(req *GetArgs) (resp GetReply) {
 	return 
 }
 
+//删除已发送分片
+func (kv *ShardKV) onDeleteShards(req *ReqDeleteShared) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if kv.config.Num == req.ConfigNum {
+		info := "" 
+		for i:=0;i<len(req.Shards);i++ {
+			shard := req.Shards[i]
+			kv.kvs[shard] = make(map[string]string)
+			info += strconv.Itoa(shard)
+			info += " "
+		}
+		kv.println(kv.gid,kv.me,"on delete",kv.config.Num," config shards",info)
+	}
+}
+
+//删除已发送分片
+func (kv *ShardKV) DeleteShards(req *ReqDeleteShared,resp *RespDeleteShared) {
+	if kv.config.Num == req.ConfigNum && req.ConfigNum > kv.deleteShardsNum {
+		kv.deleteShardsNum = req.ConfigNum
+		kv.opt(*req)
+	}
+}
+
+//请求删除已获得分片
+func (kv *ShardKV) deleteGroupShards(config *shardmaster.Config,resp *RespShareds) {
+	for group,value := range resp.Shards {
+		req := ReqDeleteShared {
+			ConfigNum : resp.ConfigNum ,
+		}
+		for shard,_ := range value.Data {
+			req.Shards = append(req.Shards,shard)
+		}
+		servers, ok := config.Groups[group]  //获取目标组服务
+		if !ok  {
+            continue 
+        }
+        resp :=RespDeleteShared{}
+		for i := 0; i < len(servers); i++ {
+			server := kv.make_end(servers[i])
+			server.Call("ShardKV.DeleteShards", &req, &resp)
+		}
+	}
+}
+//设置分片数据
 func (kv *ShardKV) onSetShard(resp *RespShareds) {
 	if kv.cofigCompleted(resp.ConfigNum) { //数据已更新
 		kv.println(kv.gid,kv.me,"not set config :",resp.ConfigNum)
@@ -272,7 +318,6 @@ func (kv *ShardKV) onSetShard(resp *RespShareds) {
 	}
 	//更新msgid
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
 	for _,shard := range resp.Shards {
 		for key,value := range shard.MsgIDs {
 			id,ok := kv.msgIDs[key]
@@ -281,12 +326,15 @@ func (kv *ShardKV) onSetShard(resp *RespShareds) {
 			}
 		}
 	}
+	preConfig := kv.config
 	kv.config = kv.nextConfig
 	kv.println(kv.gid,kv.me,"on set config :",kv.config.Num)
+	kv.mu.Unlock()
+	go kv.deleteGroupShards(&preConfig,resp)
 }
 
 func (kv *ShardKV) onGetShard(req *ReqShared) (resp RespShared) {
-	if req.Config.Num > kv.config.Num { //自己未获取最新数据
+	if req.ConfigNum > kv.config.Num { //自己未获取最新数据
 		resp.Successed = false 
 		kv.timer.Reset(0) //获取最新数据
 		return 
@@ -334,8 +382,9 @@ func (kv *ShardKV) onApply(applyMsg raft.ApplyMsg) {
 	if !applyMsg.CommandValid {  //非状态机apply消息
 		if command, ok := applyMsg.Command.(raft.LogSnapshot); ok { //更新快照消息
 			kv.updateSnapshot(command.Index,command.Datas)
-		} 
-		kv.ifSaveSnapshot()
+		}  else {
+			kv.ifSaveSnapshot(false)
+		}
 		return
 	}
 	//更新日志索引，用于创建最新快照
@@ -352,6 +401,9 @@ func (kv *ShardKV) onApply(applyMsg raft.ApplyMsg) {
 		resp = kv.onGetShard(&command)
 	} else if command, ok := opt.Req.(RespShareds);ok {  //获取其他组分片	
 		kv.onSetShard(&command)
+	} else if command, ok := opt.Req.(ReqDeleteShared); ok {
+		kv.onDeleteShards(&command)
+		kv.ifSaveSnapshot(true)  //强制刷新快照数据
 	}
 	select {
 		case opt.Ch <- resp :
@@ -368,7 +420,7 @@ func (kv *ShardKV) mainLoop() {
 			return
 		case msg := <-kv.applyCh:
 			if cap(kv.applyCh) - len(kv.applyCh) < 5 {
-				log.Println(kv.me,"warn : maybe dead lock...")
+				log.Println(kv.gid,kv.me,"warn : maybe dead lock...")
 			}
 			kv.onApply(msg)
 		case <-kv.timer.C :
@@ -383,10 +435,7 @@ func (kv *ShardKV) getShardLoop() {
 	defer kv.println(kv.gid,kv.me,"Exit ShardLoop")
 	for !kv.killed {
 		shards,isUpdated := kv.getNewShards() //获取新增分片
-		groupShards := GroupShards {
-			Config : kv.nextConfig ,
-			Shards : shards ,
-		}
+		config := kv.nextConfig
 		if !isUpdated {
 			time.Sleep(time.Millisecond*10)
 			continue
@@ -395,12 +444,12 @@ func (kv *ShardKV) getShardLoop() {
 		if len(shards) >0 {
 			kv.println(kv.gid,kv.me,"new shards",kv.nextConfig.Num,":",GetGroupShardsString(shards))
 		}
-		Num := groupShards.Config.Num
+		Num := config.Num
 		var wait sync.WaitGroup
-		wait.Add(len(groupShards.Shards))
+		wait.Add(len(shards))
 		rst := make(map[int]RespShared)
 		var mutex sync.Mutex
-		for key,value := range groupShards.Shards {  //遍历所有分片，请求数据
+		for key,value := range shards {  //遍历所有分片，请求数据
 			go func(group int,shards []int) {
 				defer wait.Done()
 				complet := false
@@ -413,7 +462,7 @@ func (kv *ShardKV) getShardLoop() {
                         continue 
                     }
                     req := ReqShared  {
-                        Config : kv.nextConfig,
+                        ConfigNum : kv.nextConfig.Num,
                         Shards : shards,
                     } 
 					for i := 0; i < len(servers); i++ {
@@ -451,7 +500,6 @@ func (kv *ShardKV) getShardLoop() {
 			time.Sleep(time.Millisecond*1000)
 		}
 	}
-	
 }
 
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, masters []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
@@ -484,15 +532,15 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		labgob.Register(RespDeleteShared{})
 		labgob.Register(shardmaster.Config{})
 	})
-	kv.applyCh = make(chan raft.ApplyMsg, 10000)
+	kv.applyCh = make(chan raft.ApplyMsg, 1000)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.mck = shardmaster.MakeClerk(kv.masters)
 	kv.rf.EnableDebugLog = false
 	kv.EnableDebugLog = false
 	kv.config.Num = 0
 	kv.nextConfig.Num = 0
+	kv.deleteShardsNum = 0
 	kv.killed = false
-	kv.shardCh = make(chan GroupShards)
 	kv.timer = time.NewTimer(time.Duration(time.Millisecond * 100))
 	go kv.mainLoop()
 	go kv.getShardLoop()

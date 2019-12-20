@@ -8,3 +8,4 @@ https://pdos.csail.mit.edu/6.824/
 - [x] Sharded K/V Service
   - [x] Part A
   - [x] Part B
+  - [x] Challenge1

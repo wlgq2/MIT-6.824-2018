@@ -47,12 +47,12 @@ type GetReply struct {
 
 type ReqShared struct {
 	Shards []int
-	Config shardmaster.Config
+	ConfigNum int
 }
 
 type RespShared struct {
 	Successed bool
-	Config  shardmaster.Config
+	ConfigNum  int
 	Data    map[int]map[string]string
 	MsgIDs  map[int64] int64
 }
@@ -63,17 +63,12 @@ type RespShareds struct {
 }
 
 type ReqDeleteShared struct {
-	Shard int
-	Config shardmaster.Config
+	Shards []int
+	ConfigNum int
 }
 
 type RespDeleteShared struct {
 	Shard int
-	Config shardmaster.Config
-}
-
-type GroupShards struct {
-	Shards map[int][]int
 	Config shardmaster.Config
 }
 
@@ -97,5 +92,17 @@ func GetGroupShardsString(shards map[int][]int) (rst string ){
 		}
 		rst += "}"
 	}
+	return rst
+}
+
+func GetServiceShardsString(kvs *[shardmaster.NShards] map[string]string) (rst string ){
+	rst += "{"
+	for i:=0; i< len(kvs); i++ {
+		if len(kvs[i]) > 0 {
+			rst += strconv.Itoa(i)
+			rst += ","
+		}
+	}
+	rst += "}"
 	return rst
 }

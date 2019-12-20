@@ -110,8 +110,8 @@ func (rf *Raft) lock(info string) {
 }
 
 func (rf *Raft) unlock(info string) {
-	rf.mu.Unlock()
 	rf.LastGetLock = ""
+	rf.mu.Unlock()
 }
 
 //投票RPC
