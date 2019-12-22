@@ -445,13 +445,12 @@ func (kv *ShardKV) getShardLoop() {
 			kv.println(kv.gid,kv.me,"new shards",kv.nextConfig.Num,":",GetGroupShardsString(shards))
 		}
 		Num := config.Num
-		var wait sync.WaitGroup
-		wait.Add(len(shards))
+		waitCh := make(chan bool,len(shards))
 		rst := make(map[int]RespShared)
 		var mutex sync.Mutex
 		for key,value := range shards {  //遍历所有分片，请求数据
 			go func(group int,shards []int) {
-				defer wait.Done()
+				defer func() {waitCh<-true}()
 				complet := false
 				var reply RespShared
 				for !complet && !(kv.cofigCompleted(Num)) && !kv.killed {
@@ -486,10 +485,22 @@ func (kv *ShardKV) getShardLoop() {
 				}
 			}(key,value)
 		}
-		if kv.killed {
-			return 
+		isTimeout  := false
+		for i:=0;i<len(shards) && !kv.killed && !isTimeout; { 
+			if kv.cofigCompleted(Num) {
+				break
+			}
+
+			select  {
+				case <- waitCh :
+					i++
+				case <-time.After(time.Millisecond * 5000): //超时
+					isTimeout = true	
+			}	
 		}
-		wait.Wait()
+		if isTimeout || kv.cofigCompleted(Num)  {
+			continue
+		}
 		//获取的状态写入RAFT，直到成功
 		for !(kv.cofigCompleted(Num)) && !kv.killed {
 			respShards := RespShareds{
