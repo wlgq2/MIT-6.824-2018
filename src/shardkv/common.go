@@ -47,17 +47,18 @@ type GetReply struct {
 
 type ReqShared struct {
 	Shards []int
-	Config shardmaster.Config
+	ConfigNum int
 }
 
 type RespShared struct {
 	Successed bool
+	ConfigNum  int
 	Data    map[int]map[string]string
 	MsgIDs  map[int64] int64
 }
 
 type RespShareds struct {
-	Config     shardmaster.Config
+	ConfigNum  int
 	Shards     map[int]RespShared
 }
 

@@ -286,7 +286,7 @@ func (kv *ShardKV) DeleteShards(req *ReqDeleteShared,resp *RespDeleteShared) {
 func (kv *ShardKV) deleteGroupShards(config *shardmaster.Config,resp *RespShareds) {
 	for group,value := range resp.Shards {
 		req := ReqDeleteShared {
-			ConfigNum : resp.Config.Num ,
+			ConfigNum : resp.ConfigNum ,
 		}
 		for shard,_ := range value.Data {
 			req.Shards = append(req.Shards,shard)
@@ -304,8 +304,8 @@ func (kv *ShardKV) deleteGroupShards(config *shardmaster.Config,resp *RespShared
 }
 //设置分片数据
 func (kv *ShardKV) onSetShard(resp *RespShareds) {
-	if kv.cofigCompleted(resp.Config.Num) { //数据已更新
-		kv.println(kv.gid,kv.me,"not set config :",resp.Config.Num)
+	if kv.cofigCompleted(resp.ConfigNum) { //数据已更新
+		kv.println(kv.gid,kv.me,"not set config :",resp.ConfigNum)
 		return 
 	}
 	//更新数据
@@ -327,15 +327,14 @@ func (kv *ShardKV) onSetShard(resp *RespShareds) {
 		}
 	}
 	preConfig := kv.config
-	kv.nextConfig = resp.Config
-	kv.config = resp.Config
+	kv.config = kv.nextConfig
 	kv.println(kv.gid,kv.me,"on set config :",kv.config.Num)
 	kv.mu.Unlock()
 	go kv.deleteGroupShards(&preConfig,resp)
 }
 
 func (kv *ShardKV) onGetShard(req *ReqShared) (resp RespShared) {
-	if req.Config.Num > kv.config.Num { //自己未获取最新数据
+	if req.ConfigNum > kv.config.Num { //自己未获取最新数据
 		resp.Successed = false 
 		kv.timer.Reset(0) //获取最新数据
 		return 
@@ -454,6 +453,7 @@ func (kv *ShardKV) getShardLoop() {
 		if len(shards) >0 {
 			kv.println(kv.gid,kv.me,"new shards",kv.nextConfig.Num,":",GetGroupShardsString(shards))
 		}
+		Num := config.Num
 		waitCh := make(chan bool,len(shards))
 		rst := make(map[int]RespShared)
 		var mutex sync.Mutex
@@ -462,7 +462,7 @@ func (kv *ShardKV) getShardLoop() {
 				defer func() {waitCh<-true}()
 				complet := false
 				var reply RespShared
-				for !complet && !(kv.cofigCompleted(config.Num)) && !kv.killed {
+				for !complet && !(kv.cofigCompleted(Num)) && !kv.killed {
 					servers, ok := kv.config.Groups[group]  //获取目标组服务
 					if !ok  {
                         kv.println(kv.gid,kv.me,"Error : can not get group",group,"shard data")
@@ -470,7 +470,7 @@ func (kv *ShardKV) getShardLoop() {
                         continue 
                     }
                     req := ReqShared  {
-                        Config : config,
+                        ConfigNum : kv.nextConfig.Num,
                         Shards : shards,
                     } 
 					for i := 0; i < len(servers); i++ {
@@ -480,14 +480,14 @@ func (kv *ShardKV) getShardLoop() {
 							complet = true
 							break
 						}
-						if kv.cofigCompleted(config.Num) || kv.killed{
+						if kv.cofigCompleted(Num) || kv.killed{
 							break
 						}
 						time.Sleep(time.Millisecond*10)
 					}
 				}
 				//存储该分片数据
-				if !kv.cofigCompleted(config.Num) && !kv.killed{
+				if !kv.cofigCompleted(Num) && !kv.killed{
 					mutex.Lock()
 					rst[group] = reply
 					mutex.Unlock()
@@ -496,7 +496,7 @@ func (kv *ShardKV) getShardLoop() {
 		}
 		isTimeout  := false
 		for i:=0;i<len(shards) && !kv.killed && !isTimeout; { 
-			if kv.cofigCompleted(config.Num) {
+			if kv.cofigCompleted(Num) {
 				break
 			}
 
@@ -507,14 +507,14 @@ func (kv *ShardKV) getShardLoop() {
 					isTimeout = true	
 			}	
 		}
-		if isTimeout || kv.cofigCompleted(config.Num)  || !kv.isLeader() {
+		if isTimeout || kv.cofigCompleted(Num)  || !kv.isLeader() {
 			time.Sleep(time.Millisecond*10)
 			continue
 		}
 		//获取的状态写入RAFT，直到成功
-		for !(kv.cofigCompleted(config.Num)) && !kv.killed && kv.isLeader() {
+		for !(kv.cofigCompleted(Num)) && !kv.killed && kv.isLeader() {
 			respShards := RespShareds{
-				Config : config ,
+				ConfigNum : Num ,
 				Shards : rst,
 			} 
 			kv.startShard(&respShards)
