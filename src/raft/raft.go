@@ -469,6 +469,7 @@ func (rf *Raft) persist() {
 	encoder.Encode(rf.logs)
 	encoder.Encode(rf.lastLogs)
 	encoder.Encode(rf.logSnapshot.Index)
+    encoder.Encode(rf.logSnapshot.Term)
 	data := writer.Bytes()
 	//rf.persister.SaveRaftState(data)
 	rf.unlock("Raft.persist")
@@ -497,7 +498,8 @@ func (rf *Raft) readPersist(data []byte) {
 		decoder.Decode(&commitIndex) != nil ||
 		decoder.Decode(&logs) != nil ||
 		decoder.Decode(&lastlogs) != nil  ||
-		decoder.Decode(&rf.logSnapshot.Index) != nil {
+		decoder.Decode(&rf.logSnapshot.Index) != nil ||
+        decoder.Decode(&rf.logSnapshot.Term) != nil {
 		rf.println("Error in unmarshal raft state")
 	} else {
 
