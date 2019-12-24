@@ -430,10 +430,19 @@ func (kv *ShardKV) mainLoop() {
 	}
 	
 }
+func (kv *ShardKV) isLeader() bool  {
+	_,rst := kv.rf.GetState()
+	return rst
+}
+
 //请求其他组数据
 func (kv *ShardKV) getShardLoop() {
 	defer kv.println(kv.gid,kv.me,"Exit ShardLoop")
 	for !kv.killed {
+		if !kv.isLeader() {
+			time.Sleep(time.Millisecond*10)
+			continue
+		}
 		shards,isUpdated := kv.getNewShards() //获取新增分片
 		config := kv.nextConfig
 		if !isUpdated {
@@ -498,11 +507,12 @@ func (kv *ShardKV) getShardLoop() {
 					isTimeout = true	
 			}	
 		}
-		if isTimeout || kv.cofigCompleted(Num)  {
+		if isTimeout || kv.cofigCompleted(Num)  || !kv.isLeader() {
+			time.Sleep(time.Millisecond*10)
 			continue
 		}
 		//获取的状态写入RAFT，直到成功
-		for !(kv.cofigCompleted(Num)) && !kv.killed {
+		for !(kv.cofigCompleted(Num)) && !kv.killed && kv.isLeader() {
 			respShards := RespShareds{
 				ConfigNum : Num ,
 				Shards : rst,
