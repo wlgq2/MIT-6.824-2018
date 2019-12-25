@@ -53,13 +53,13 @@ type ReqShared struct {
 type RespShared struct {
 	Successed bool
 	ConfigNum  int
+	Group      int
 	Data    map[int]map[string]string
 	MsgIDs  map[int64] int64
 }
 
 type RespShareds struct {
 	ConfigNum  int
-	Shards     map[int]RespShared
 }
 
 type ReqDeleteShared struct {
