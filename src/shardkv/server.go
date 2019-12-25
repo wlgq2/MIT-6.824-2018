@@ -106,16 +106,23 @@ func (kv *ShardKV) setConfig(config *shardmaster.Config) bool  {
 //raft更新shard
 func (kv *ShardKV) startShard(shards *RespShareds) {
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
 	if kv.config.Num < kv.nextConfig.Num {
+		kv.mu.Unlock()
 		op := Op {
 			Req : *shards, //请求数据
-			Ch : make(chan(interface{})), //日志提交chan
+			Ch : make(chan(interface{}),1), //日志提交chan
 		}
 		index,term,isLeader := kv.rf.Start(op) //写入Raft
 		if isLeader {
-			kv.println(kv.gid,kv.me,"start shard ", kv.nextConfig.Num,"term",term,"index",index)
+			select {
+				case  <-op.Ch:
+					kv.println(kv.gid,kv.me,"on start shard ", kv.nextConfig.Num,"term",term,"index",index)
+				case <-time.After(time.Millisecond * 1000): //超时
+					kv.println(kv.gid,kv.me,"start shard timeout", kv.nextConfig.Num,"term",term,"index",index)
+			}
 		}
+	} else {
+		kv.mu.Unlock()
 	}
 }
 //raft更新config
@@ -137,7 +144,7 @@ func (kv *ShardKV) isTrueGroup(shard int) bool{
 	if kv.config.Num == 0 {
 		return false
 	}
-	return kv.config.Shards[shard] == kv.gid && kv.nextConfig.Num == kv.config.Num
+	return kv.config.Shards[shard] == kv.gid// && kv.nextConfig.Num == kv.config.Num
 }
 
 //raft操作
@@ -262,13 +269,15 @@ func (kv *ShardKV) get(req *GetArgs) (resp GetReply) {
 func (kv *ShardKV) onDeleteShards(req *ReqDeleteShared) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	if kv.config.Num == req.ConfigNum {
+	if kv.config.Num == req.ConfigNum || kv.config.Num == req.ConfigNum+1 {
 		info := "" 
-		for i:=0;i<len(req.Shards);i++ {
+		for i:=0;i<len(req.Shards);i++  {
 			shard := req.Shards[i]
-			kv.kvs[shard] = make(map[string]string)
-			info += strconv.Itoa(shard)
-			info += " "
+			if kv.config.Shards[shard] != kv.gid {
+				kv.kvs[shard] = make(map[string]string)
+				info += strconv.Itoa(shard)
+				info += " "
+			}
 		}
 		kv.println(kv.gid,kv.me,"on delete",kv.config.Num," config shards",info)
 	}
@@ -276,9 +285,11 @@ func (kv *ShardKV) onDeleteShards(req *ReqDeleteShared) {
 
 //删除已发送分片
 func (kv *ShardKV) DeleteShards(req *ReqDeleteShared,resp *RespDeleteShared) {
-	if kv.config.Num == req.ConfigNum && req.ConfigNum > kv.deleteShardsNum {
-		kv.deleteShardsNum = req.ConfigNum
-		kv.opt(*req)
+	if  req.ConfigNum > kv.deleteShardsNum {
+		if kv.config.Num == req.ConfigNum || kv.config.Num == req.ConfigNum+1 {
+			kv.deleteShardsNum = req.ConfigNum
+			kv.opt(*req)
+		}
 	}
 }
 
@@ -305,7 +316,6 @@ func (kv *ShardKV) deleteGroupShards(config *shardmaster.Config,resp *RespShared
 //设置分片数据
 func (kv *ShardKV) onSetShard(resp *RespShareds) {
 	if kv.cofigCompleted(resp.ConfigNum) { //数据已更新
-		kv.println(kv.gid,kv.me,"not set config :",resp.ConfigNum)
 		return 
 	}
 	//更新数据
@@ -413,7 +423,7 @@ func (kv *ShardKV) onApply(applyMsg raft.ApplyMsg) {
 //轮询
 func (kv *ShardKV) mainLoop() {
 	defer kv.println(kv.gid,kv.me,"Exit mainLoop")
-	duration := time.Duration(time.Millisecond * 10)
+	duration := time.Duration(time.Millisecond * 80)
 	for !kv.killed {
 		select {
 		case <-kv.killChan:
@@ -436,17 +446,18 @@ func (kv *ShardKV) isLeader() bool  {
 }
 
 //请求其他组数据
-func (kv *ShardKV) getShardLoop() {
+func (kv *ShardKV) shardLoop() {
 	defer kv.println(kv.gid,kv.me,"Exit ShardLoop")
 	for !kv.killed {
 		if !kv.isLeader() {
-			time.Sleep(time.Millisecond*10)
+			time.Sleep(time.Millisecond*100)
 			continue
 		}
+		//kv.updateConfig()
 		shards,isUpdated := kv.getNewShards() //获取新增分片
 		config := kv.nextConfig
 		if !isUpdated {
-			time.Sleep(time.Millisecond*10)
+			time.Sleep(time.Millisecond*100)
 			continue
 		}
 		kv.println(kv.gid,kv.me,"update config",kv.nextConfig.Num,":",shardmaster.GetShardsInfoString(&(kv.nextConfig.Shards)))
@@ -503,12 +514,12 @@ func (kv *ShardKV) getShardLoop() {
 			select  {
 				case <- waitCh :
 					i++
-				case <-time.After(time.Millisecond * 5000): //超时
+				case <-time.After(time.Millisecond * 2000): //超时
 					isTimeout = true	
 			}	
 		}
 		if isTimeout || kv.cofigCompleted(Num)  || !kv.isLeader() {
-			time.Sleep(time.Millisecond*10)
+			time.Sleep(time.Millisecond*100)
 			continue
 		}
 		//获取的状态写入RAFT，直到成功
@@ -518,8 +529,8 @@ func (kv *ShardKV) getShardLoop() {
 				Shards : rst,
 			} 
 			kv.startShard(&respShards)
-			time.Sleep(time.Millisecond*1000)
 		}
+		time.Sleep(time.Millisecond*100)
 	}
 }
 
@@ -564,6 +575,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.killed = false
 	kv.timer = time.NewTimer(time.Duration(time.Millisecond * 100))
 	go kv.mainLoop()
-	go kv.getShardLoop()
+	go kv.shardLoop()
 	return kv
 }
