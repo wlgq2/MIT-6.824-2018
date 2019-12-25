@@ -144,7 +144,7 @@ func (kv *ShardKV) isTrueGroup(shard int) bool{
 	if kv.config.Num == 0 {
 		return false
 	}
-	return kv.config.Shards[shard] == kv.gid// && kv.nextConfig.Num == kv.config.Num
+	return kv.config.Shards[shard] == kv.gid
 }
 
 //raft操作
@@ -535,10 +535,6 @@ func (kv *ShardKV) shardLoop() {
 }
 
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, masters []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
-	// call labgob.Register on structures you want
-	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
-
 	kv := new(ShardKV)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
@@ -550,7 +546,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		kv.kvs[i] = make(map[string]string)
 	}
 	kv.msgIDs = make(map[int64]int64)
-	kv.killChan = make(chan (bool),2)
+	kv.killChan = make(chan (bool),1)
 	kv.persister = persister
 	kv.logApplyIndex = 0
 	shardKvOnce.Do(func() {
