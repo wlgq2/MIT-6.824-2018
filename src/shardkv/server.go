@@ -119,7 +119,15 @@ func (kv *ShardKV) isTrueGroup(shard int) bool{
 	if kv.config.Num == 0 {
 		return false
 	}
-	return kv.config.Shards[shard] == kv.gid
+	group := kv.config.Shards[shard]
+	if group == kv.gid {
+		return true
+	} else if kv.nextConfig.Shards[shard] == kv.gid { //正在转移数据过程中
+		_,ok := kv.notReadyShards[group]
+		return !ok
+	} else {
+		return false
+	}
 }
 
 //raft操作

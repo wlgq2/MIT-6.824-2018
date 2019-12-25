@@ -9,4 +9,4 @@ https://pdos.csail.mit.edu/6.824/
   - [x] Part A
   - [x] Part B
   - [x] Challenge1
-  - [ ] Challenge2
+  - [x] Challenge2
